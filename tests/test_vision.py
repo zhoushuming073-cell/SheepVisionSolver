@@ -51,6 +51,21 @@ def test_apk_templates_detect_and_render(tmp_path: Path):
     assert output.exists()
 
 
+def test_local_recognition_and_target_confirmation():
+    detector = TemplateDetector(TILES)
+    frame = _synthetic_frame()
+    profile = VisionProfile(Region(0, 0, 460, 310), Region(0, 320, 460, 200),
+                            scales=(1.0,), icon_threshold=.94, click_threshold=.97,
+                            ambiguity_margin=.005)
+    observed = detector.detect_board_region(frame, profile, Region(0, 0, 220, 250))
+    first = next(tile for tile in observed if tile.type_id == "1" and tile.clickable)
+    assert detector.confirm_target(frame, profile, first)
+    changed = frame.image.copy()
+    changed.paste((80, 125, 90), (45, 55, 165, 190))
+    after = CapturedFrame(changed, frame.region, "after", "synthetic")
+    assert not detector.confirm_target(after, profile, first)
+
+
 def test_unclassified_tray_card_blocks_automatic_decision():
     frame = _synthetic_frame()
     image = frame.image.convert("RGBA")

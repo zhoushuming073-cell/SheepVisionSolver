@@ -84,6 +84,7 @@ class ObservedTile:
     clickable_confidence: float = 1.0
     visible_face: bool = True
     clickability_reason: str = "simulator rule"
+    visibility: Literal["full", "partial"] = "full"
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
