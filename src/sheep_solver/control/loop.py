@@ -1,20 +1,20 @@
-"""One observed action at a time, with a fresh pre-click check and feedback."""
+"""One transactional click at a time, using visible memory and local feedback."""
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Callable
 
-import numpy as np
-
 from sheep_solver.capture.screen import CapturedFrame, Region, capture_frame
-from sheep_solver.core.models import Observation
+from sheep_solver.core.memory import StateConflict, VisibleMemory
+from sheep_solver.core.models import Observation, ObservedTile
 from sheep_solver.planning.basic import Action, BasicPlanner, Decision
 from sheep_solver.vision.detector import TemplateDetector, VisionProfile
+from sheep_solver.vision.frame_diff import changed_fraction
 
 from .mouse import SafeMouse
 
@@ -27,6 +27,7 @@ class StepOutcome:
     before: Observation | None = None
     after: Observation | None = None
     after_frame: CapturedFrame | None = None
+    metrics: dict[str, float | int] = field(default_factory=dict)
 
 
 class VisualController:
@@ -35,7 +36,9 @@ class VisualController:
                  mouse: SafeMouse | None = None,
                  stop_event: Event | None = None,
                  capture: Callable[[Region], CapturedFrame] = capture_frame,
-                 animation_delay: float = .9, log_path: str | Path = "data/logs/actions.jsonl"):
+                 feedback_timeout: float = 1.6, poll_interval: float = .04,
+                 animation_delay: float | None = None,
+                 log_path: str | Path = "data/logs/actions.jsonl"):
         self.detector = detector
         self.profile = profile
         self.game_region = game_region
@@ -43,23 +46,107 @@ class VisualController:
         self.stop_event = stop_event or Event()
         self.mouse = mouse or SafeMouse(stop_event=self.stop_event)
         self.capture = capture
-        self.animation_delay = animation_delay
+        self.feedback_timeout = feedback_timeout
+        self.poll_interval = poll_interval
         self.log_path = Path(log_path)
+        self.memory: VisibleMemory | None = None
+        self.last_frame: CapturedFrame | None = None
+        self._step_lock = Lock()
+
+    def initialize_from_observation(self, frame: CapturedFrame,
+                                    observation: Observation) -> None:
+        """Reuse a GUI result instead of scanning its frame again."""
+        if frame.region != self.game_region or observation.game_region != frame.region.bbox:
+            raise StateConflict("Calibration or frame origin changed")
+        self.memory = VisibleMemory(observation)
+        self.last_frame = frame
+
+    def _capture(self, metrics: dict[str, float | int]) -> CapturedFrame:
+        started = time.perf_counter()
+        frame = self.capture(self.game_region)
+        metrics["captures"] = int(metrics["captures"]) + 1
+        metrics["capture_ms"] = float(metrics["capture_ms"]) + (time.perf_counter() - started) * 1000
+        return frame
+
+    def _full_detect(self, frame: CapturedFrame,
+                     metrics: dict[str, float | int]) -> Observation:
+        started = time.perf_counter()
+        observation = self.detector.detect(frame, self.profile)
+        metrics["full_detects"] = int(metrics["full_detects"]) + 1
+        metrics["full_detect_ms"] = float(metrics["full_detect_ms"]) + (time.perf_counter() - started) * 1000
+        return observation
+
+    def _resync(self, frame: CapturedFrame,
+                metrics: dict[str, float | int]) -> Observation | None:
+        self.memory = None
+        self.last_frame = None
+        try:
+            observation = self._full_detect(frame, metrics)
+            self.initialize_from_observation(frame, observation)
+            return self.memory.observation() if self.memory else None
+        except (StateConflict, ValueError):
+            return None
 
     @staticmethod
-    def _changed_fraction(a: CapturedFrame, b: CapturedFrame, region: Region) -> float:
-        first = np.asarray(a.image.convert("RGB"))[region.top:region.bottom, region.left:region.right]
-        second = np.asarray(b.image.convert("RGB"))[region.top:region.bottom, region.left:region.right]
-        if first.shape != second.shape:
-            return 1.0
-        return float(np.mean(np.max(np.abs(first.astype(np.int16) - second.astype(np.int16)), axis=2) > 25))
+    def _affected_region(tile: ObservedTile, board: Region) -> Region:
+        padding = round(max(tile.width, tile.height))
+        left = max(board.left, round(tile.x) - padding)
+        top = max(board.top, round(tile.y) - padding)
+        right = min(board.right, round(tile.x + tile.width) + padding)
+        bottom = min(board.bottom, round(tile.y + tile.height) + padding)
+        return Region(left, top, right - left, bottom - top)
 
     @staticmethod
-    def _target_still_visible(after: Observation, action: Action) -> bool:
-        return any(tile.type_id == action.type_id and
-                   abs(tile.center[0] - action.local_x) < tile.width * .3 and
-                   abs(tile.center[1] - action.local_y) < tile.height * .3
-                   for tile in after.tiles)
+    def _tile_region(tile: ObservedTile, board: Region) -> Region:
+        left = max(board.left, round(tile.x))
+        top = max(board.top, round(tile.y))
+        right = min(board.right, round(tile.x + tile.width))
+        bottom = min(board.bottom, round(tile.y + tile.height))
+        return Region(left, top, right - left, bottom - top)
+
+    def _wait_for_feedback(self, before: CapturedFrame, tile: ObservedTile,
+                           metrics: dict[str, float | int]) -> tuple[CapturedFrame, bool]:
+        target_region = self._tile_region(tile, self.profile.board)
+        deadline = time.monotonic() + self.feedback_timeout
+        previous = before
+        changed = False
+        quiet = 0
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            if self.stop_event.wait(self.poll_interval):
+                break
+            current = self._capture(metrics)
+            target_delta = changed_fraction(before, current, target_region, stride=2)
+            tray_delta = changed_fraction(before, current, self.profile.tray, stride=4)
+            changed = changed or target_delta > .05 or tray_delta > .015
+            if changed:
+                motion = max(changed_fraction(previous, current, target_region, stride=2),
+                             changed_fraction(previous, current, self.profile.tray, stride=4))
+                quiet = quiet + 1 if motion < .012 else 0
+                if quiet >= 1:
+                    return current, True
+            previous = current
+        return previous, False
+
+    def _manual_decision(self, before: Observation, manual_id: str,
+                         expected: tuple[str, int, int] | None,
+                         base: Decision) -> Decision:
+        if expected is None:
+            return Decision(base.candidates, None, "人工选择缺少目标类型和位置")
+        kind, x, y = expected
+        tile = next((candidate for candidate in before.tiles
+                     if candidate.type_id == kind and candidate.clickable and
+                     abs(candidate.center[0] - x) <= 5 and
+                     abs(candidate.center[1] - y) <= 5), None)
+        if tile is None:
+            return Decision(base.candidates, None, "人工指定的牌不可点击或已变化")
+        if manual_id.startswith("tile_") and manual_id != tile.id:
+            return Decision(base.candidates, None, "人工指定的目标 ID 与当前方块不匹配")
+        local_x, local_y = round(tile.center[0]), round(tile.center[1])
+        return Decision(base.candidates,
+                        Action(tile.id, kind, local_x, local_y,
+                               self.game_region.left + local_x,
+                               self.game_region.top + local_y, "人工选择已识别方块"),
+                        "人工选择已识别方块")
 
     def _record(self, outcome: StepOutcome) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,73 +159,118 @@ class VisualController:
             "after_timestamp": outcome.after.timestamp if outcome.after else None,
             "before_tray": outcome.before.tray if outcome.before else None,
             "after_tray": outcome.after.tray if outcome.after else None,
+            "metrics": outcome.metrics,
         }
         with self.log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(data, ensure_ascii=False) + "\n")
 
-    def run_once(self, manual_tile_id: str | None = None,
-                 manual_expected: tuple[str, int, int] | None = None) -> StepOutcome:
+    def _run_step(self, manual_tile_id: str | None,
+                  manual_expected: tuple[str, int, int] | None,
+                  metrics: dict[str, float | int]) -> StepOutcome:
         if self.stop_event.is_set():
             return StepOutcome(False, "已停止", Decision((), None, "已停止"))
+        if self.memory is None:
+            initial_frame = self._capture(metrics)
+            initial = self._full_detect(initial_frame, metrics)
+            self.initialize_from_observation(initial_frame, initial)
+        assert self.memory is not None and self.last_frame is not None
+        before = self.memory.observation()
+        decision = self.planner.decide(before)
+        if manual_tile_id is not None:
+            decision = self._manual_decision(before, manual_tile_id, manual_expected, decision)
+        if decision.action is None:
+            return StepOutcome(False, decision.reason, decision, before=before)
+
+        target = self.memory.tiles.get(decision.action.tile_id)
+        if target is None or target.type_id != decision.action.type_id:
+            raise StateConflict("Decision target identity changed")
+        preclick_started = time.perf_counter()
+        fresh = self._capture(metrics)
+        if (changed_fraction(self.last_frame, fresh, self.profile.board) > .03 or
+                changed_fraction(self.last_frame, fresh, self.profile.tray) > .03):
+            after = self._resync(fresh, metrics)
+            return StepOutcome(False, "点击前画面变化，已重新同步", decision, before, after, fresh)
+        if not self.detector.confirm_target(fresh, self.profile, target):
+            after = self._resync(fresh, metrics)
+            return StepOutcome(False, "点击前目标牌验证失败，已重新同步", decision, before, after, fresh)
+        metrics["preclick_ms"] = (time.perf_counter() - preclick_started) * 1000
+
+        self.memory.begin_click(target.id, target.type_id)
         try:
-            before_frame = self.capture(self.game_region)
-            before = self.detector.detect(before_frame, self.profile)
-            decision = self.planner.decide(before)
-            if manual_tile_id is not None:
-                tile = next((tile for tile in before.tiles if tile.id == manual_tile_id and tile.clickable and tile.type_id), None)
-                if (manual_expected is None or tile is None or tile.type_id != manual_expected[0] or
-                        abs(tile.center[0] - manual_expected[1]) > 5 or
-                        abs(tile.center[1] - manual_expected[2]) > 5):
-                    tile = None
-                if tile is None:
-                    decision = Decision(decision.candidates, None, "人工指定的牌不可点击或已变化")
-                else:
-                    local_x, local_y = round(tile.center[0]), round(tile.center[1])
-                    decision = Decision(decision.candidates,
-                                        Action(tile.id, tile.type_id, local_x, local_y,
-                                               self.game_region.left + local_x,
-                                               self.game_region.top + local_y, "人工选择已识别方块"),
-                                        "人工选择已识别方块")
-            if decision.action is None:
-                outcome = StepOutcome(False, decision.reason, decision, before=before)
-                self._record(outcome)
-                return outcome
-            fresh = self.capture(self.game_region)
-            if (self._changed_fraction(before_frame, fresh, self.profile.board) > .03 or
-                    self._changed_fraction(before_frame, fresh, self.profile.tray) > .03):
-                outcome = StepOutcome(False, "点击前画面已变化，需重新识别", decision, before=before)
-                self._record(outcome)
-                return outcome
-            fresh_observation = self.detector.detect(fresh, self.profile)
-            target = next((tile for tile in fresh_observation.tiles
-                           if tile.type_id == decision.action.type_id and tile.clickable and
-                           tile.id == decision.action.tile_id and
-                           abs(tile.center[0] - decision.action.local_x) <= 5 and
-                           abs(tile.center[1] - decision.action.local_y) <= 5), None)
-            if (target is None or fresh_observation.tray != before.tray or
-                    fresh_observation.tray_confidence < .95):
-                outcome = StepOutcome(False, "点击前目标牌或卡槽已变化，需重新识别", decision, before=before)
-                self._record(outcome)
-                return outcome
             self.mouse.click(decision.action, self.game_region, self.profile.board)
-            if self.stop_event.wait(self.animation_delay):
-                outcome = StepOutcome(False, "点击后收到停止命令", decision, before=before)
-                self._record(outcome)
-                return outcome
-            after_frame = self.capture(self.game_region)
-            after = self.detector.detect(after_frame, self.profile)
-            board_change = self._changed_fraction(before_frame, after_frame, self.profile.board)
-            tray_change = self._changed_fraction(before_frame, after_frame, self.profile.tray)
-            changed = board_change > .005 or tray_change > .005
-            expected = (not self._target_still_visible(after, decision.action) or
-                        before.tray != after.tray)
-            success = changed and expected and after.tray_confidence >= .95
-            reason = "点击后画面变化已确认" if success else "点击反馈异常或卡槽识别不可靠，已停止"
-            outcome = StepOutcome(success, reason, decision, before, after, after_frame)
+        except Exception:
+            self.memory.abort_click()
+            self.memory = None  # The backend may have sent a partial click.
+            self.last_frame = None
+            raise
+        feedback_started = time.perf_counter()
+        after_frame, confirmed = self._wait_for_feedback(fresh, target, metrics)
+        metrics["feedback_ms"] = (time.perf_counter() - feedback_started) * 1000
+        if self.stop_event.is_set():
+            self.memory.abort_click()
+            self.memory = None
+            self.last_frame = None
+            return StepOutcome(False, "点击后收到停止命令；下次需重新同步", decision, before,
+                               after_frame=after_frame)
+        if not confirmed or self.detector.confirm_target(after_frame, self.profile, target):
+            self.memory.abort_click()
+            after = self._resync(after_frame, metrics)
+            return StepOutcome(False, "点击反馈未确认，已重新同步并停止", decision, before,
+                               after, after_frame)
+
+        expected_tray = self.memory.pending.expected_tray
+        affected = self._affected_region(target, self.profile.board)
+        local_started = time.perf_counter()
+        local_tiles = self.detector.detect_board_region(after_frame, self.profile, affected)
+        metrics["local_detects"] = 1
+        metrics["local_detect_ms"] = (time.perf_counter() - local_started) * 1000
+        try:
+            self.memory.commit_click(local_tiles, affected, confirmed=True,
+                                     timestamp=after_frame.timestamp)
+        except StateConflict:
+            after = self._resync(after_frame, metrics)
+            if after is None or after.tray != expected_tray:
+                return StepOutcome(False, "局部状态冲突，完整同步后卡槽不一致", decision,
+                                   before, after, after_frame)
+            self.last_frame = after_frame
+            return StepOutcome(True, "点击已确认；局部冲突后完整同步", decision,
+                               before, after, after_frame)
+
+        self.last_frame = after_frame
+        observed_occupancy = self.detector.tray_card_count(after_frame, self.profile)
+        if observed_occupancy != len(self.memory.tray):
+            after = self._resync(after_frame, metrics)
+            if after is None or after.tray != expected_tray:
+                return StepOutcome(False, "卡槽模拟与屏幕不一致，已停止", decision,
+                                   before, after, after_frame)
+            return StepOutcome(True, "点击已确认；卡槽数量复核后完整同步", decision,
+                               before, after, after_frame)
+        after = self.memory.observation()
+        return StepOutcome(True, "点击和局部状态变化已确认", decision, before, after, after_frame)
+
+    def run_once(self, manual_tile_id: str | None = None,
+                 manual_expected: tuple[str, int, int] | None = None) -> StepOutcome:
+        if not self._step_lock.acquire(blocking=False):
+            return StepOutcome(False, "已有未完成的点击事务", Decision((), None, "已有事务"))
+        started = time.perf_counter()
+        metrics: dict[str, float | int] = {
+            "captures": 0, "full_detects": 0, "local_detects": 0,
+            "capture_ms": 0.0, "full_detect_ms": 0.0,
+            "preclick_ms": 0.0, "feedback_ms": 0.0, "local_detect_ms": 0.0,
+        }
+        try:
+            try:
+                outcome = self._run_step(manual_tile_id, manual_expected, metrics)
+            except Exception as exc:
+                if self.memory is not None:
+                    self.memory.abort_click()
+                self.memory = None  # Never reuse uncertain state after an exception.
+                self.last_frame = None
+                outcome = StepOutcome(False, f"异常：{type(exc).__name__}: {exc}",
+                                      Decision((), None, "执行异常"))
+            metrics["cycle_ms"] = (time.perf_counter() - started) * 1000
+            outcome = replace(outcome, metrics=dict(metrics))
             self._record(outcome)
             return outcome
-        except Exception as exc:
-            outcome = StepOutcome(False, f"异常：{type(exc).__name__}: {exc}",
-                                  Decision((), None, "执行异常"))
-            self._record(outcome)
-            return outcome
+        finally:
+            self._step_lock.release()

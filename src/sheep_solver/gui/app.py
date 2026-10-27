@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import tkinter as tk
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from datetime import datetime
 from threading import Event, Thread
 from tkinter import filedialog, messagebox, ttk
@@ -44,7 +45,11 @@ class SheepApp:
         self.mouse = SafeMouse(stop_event=self.stop_event)
         self.running = False
         self.step_active = False
-        self.step_results: Queue[StepOutcome] = Queue()
+        self.step_thread: Thread | None = None
+        self.step_results: Queue[StepOutcome] = Queue(maxsize=2)
+        self.recognition_results: Queue[tuple[Observation | None, str | None]] = Queue(maxsize=1)
+        self.recognition_active = False
+        self._last_preview = 0.0
         self.mark_mode: str | None = None
         self.drag_start: tuple[int, int] | None = None
         self.preview_scale = 1.0
@@ -136,6 +141,9 @@ class SheepApp:
 
     def select_game_region(self) -> None:
         self.stop()
+        if self.step_active or self.recognition_active:
+            self._status("请等待当前操作停止后再重新校准")
+            return
 
         def selected(region: Region | None) -> None:
             if region is None:
@@ -143,6 +151,8 @@ class SheepApp:
                 return
             self.game_region = region
             self.board = self.tray = None
+            self.controller = None
+            self.observation = None
             self._save_calibration()
             self._status(f"游戏区域：{region.bbox}；请分别框选主牌区和卡槽区")
             self.capture()
@@ -153,6 +163,9 @@ class SheepApp:
             self._status(f"区域选择失败：{exc}")
 
     def capture(self) -> None:
+        if self.step_active or self.recognition_active:
+            self._status("操作正在进行，请先暂停并等待完成")
+            return
         if self.game_region is None:
             self._status("请先选择游戏区域")
             return
@@ -160,6 +173,7 @@ class SheepApp:
             self.frame = capture_frame(self.game_region)
             self.scale_var.set(f"{.68 * self.frame.image.width / 888:.3f}")
             self.observation = None
+            self.controller = None
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             save_frame(self.frame, ROOT / "data" / "screenshots" / f"capture-{stamp}.png")
             self._show_preview(self.frame.image)
@@ -168,6 +182,9 @@ class SheepApp:
             self._status(f"截图失败：{exc}")
 
     def open_image(self) -> None:
+        if self.step_active or self.recognition_active:
+            self._status("操作正在进行，请先暂停并等待完成")
+            return
         path = filedialog.askopenfilename(filetypes=[("图像", "*.png *.jpg *.jpeg *.bmp")])
         if not path:
             return
@@ -175,6 +192,7 @@ class SheepApp:
             self.frame = load_frame(path)
             self.scale_var.set(f"{.68 * self.frame.image.width / 888:.3f}")
             self.observation = None
+            self.controller = None
             self.board = self.tray = None
             self._show_preview(self.frame.image)
             self._status("已打开离线截图；可识别和调试，不能据此点击实时桌面")
@@ -204,6 +222,9 @@ class SheepApp:
                                         text=name, fill=color, anchor="nw", tags="calibration")
 
     def _begin_mark(self, mode: str) -> None:
+        if self.step_active or self.recognition_active:
+            self._status("请先暂停并等待当前操作结束")
+            return
         if self.frame is None:
             self._status("先获取或打开截图")
             return
@@ -240,6 +261,8 @@ class SheepApp:
             self.board = region
         else:
             self.tray = region
+        self.controller = None
+        self.observation = None
         self.mark_mode = None
         if self.frame.source == "screen":
             self._save_calibration()
@@ -264,37 +287,71 @@ class SheepApp:
 
     def recognize(self) -> None:
         profile = self._profile()
-        if profile is None or self.frame is None:
+        if profile is None or self.frame is None or self.step_active or self.recognition_active:
             return
+        frame = self.frame
+        self.recognition_active = True
+        self._status("后台识别中…")
+
+        def worker() -> None:
+            try:
+                self.recognition_results.put((self.detector.detect(frame, profile), None))
+            except Exception as exc:
+                self.recognition_results.put((None, str(exc)))
+
+        Thread(target=worker, daemon=True).start()
+        self.root.after(50, self._poll_recognition)
+
+    def _poll_recognition(self) -> None:
         try:
-            self.observation = self.detector.detect(self.frame, profile)
-            self._show_preview(draw_debug(self.frame.image, self.observation))
-            self.tile_list.delete(0, tk.END)
-            self.list_ids.clear()
-            for tile in self.observation.tiles:
-                self.tile_list.insert(tk.END, f"{tile.id} 类型{tile.type_id or '?'} {tile.confidence:.2f} {'可点' if tile.clickable else '待核实'}")
-                self.list_ids.append(tile.id)
-            self.tray_var.set("卡槽：" + (", ".join(self.observation.tray) or "空"))
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            debug_path = ROOT / "data" / "screenshots" / f"debug-{stamp}.png"
-            debug_path.parent.mkdir(parents=True, exist_ok=True)
-            draw_debug(self.frame.image, self.observation).save(debug_path)
-            self._status(f"识别 {len(self.observation.tiles)} 张；可点 {sum(t.clickable for t in self.observation.tiles)} 张；调试图：{debug_path}")
-        except Exception as exc:
-            self._status(f"识别失败：{exc}")
+            observation, error = self.recognition_results.get_nowait()
+        except Empty:
+            self.root.after(50, self._poll_recognition)
+            return
+        self.recognition_active = False
+        if error or observation is None or self.frame is None:
+            self._status(f"识别失败：{error}")
+            return
+        self.observation = observation
+        debug_image = draw_debug(self.frame.image, observation)
+        self._show_preview(debug_image)
+        self._update_tile_list(observation)
+        self.tray_var.set("卡槽：" + (", ".join(observation.tray) or "空"))
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        debug_path = ROOT / "data" / "screenshots" / f"debug-{stamp}.png"
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_image.save(debug_path)
+        self._status(f"识别 {len(observation.tiles)} 张；可点 {sum(t.clickable for t in observation.tiles)} 张；调试图：{debug_path}")
+
+    def _update_tile_list(self, observation: Observation) -> None:
+        self.tile_list.delete(0, tk.END)
+        self.list_ids.clear()
+        for tile in observation.tiles:
+            self.tile_list.insert(tk.END, f"{tile.id} 类型{tile.type_id or '?'} {tile.confidence:.2f} {'可点' if tile.clickable else '待核实'}")
+            self.list_ids.append(tile.id)
 
     def _new_controller(self) -> VisualController | None:
-        if self.step_active:
+        if self.step_active or self.recognition_active:
             self._status("当前一步仍在识别或验证，请等待其结束")
             return None
         profile = self._profile()
         if profile is None or self.game_region is None or self.frame is None or self.frame.source != "screen":
             self._status("点击前请从实时游戏区域获取截图并完成主牌区、卡槽区校准")
             return None
+        if (self.controller is not None and self.controller.memory is not None and
+                self.controller.profile == profile and
+                self.controller.game_region == self.game_region and
+                not self.controller.stop_event.is_set()):
+            return self.controller
         self.stop_event.clear()
         self.controller = VisualController(self.detector, profile, self.game_region,
                                            mouse=self.mouse, stop_event=self.stop_event,
                                            log_path=LOG_PATH)
+        if self.observation is not None and self.frame.region == self.game_region:
+            try:
+                self.controller.initialize_from_observation(self.frame, self.observation)
+            except ValueError:
+                pass  # Fresh screen recognition remains available in the worker.
         return self.controller
 
     def _apply_outcome(self, outcome: StepOutcome) -> None:
@@ -302,7 +359,11 @@ class SheepApp:
         if outcome.after_frame and outcome.after:
             self.frame = outcome.after_frame
             self.observation = outcome.after
-            self._show_preview(draw_debug(self.frame.image, outcome.after))
+            self._update_tile_list(outcome.after)
+            if not self.running or time.monotonic() - self._last_preview >= .5:
+                self._show_preview(self.frame.image if self.running else
+                                   draw_debug(self.frame.image, outcome.after))
+                self._last_preview = time.monotonic()
             self.tray_var.set("卡槽：" + (", ".join(outcome.after.tray) or "空"))
         if not outcome.success:
             self.running = False
@@ -342,26 +403,36 @@ class SheepApp:
         self.step_active = True
 
         def worker() -> None:
-            self.step_results.put(controller.run_once(manual_tile_id, manual_expected))
+            first = True
+            while first or (self.running and not controller.stop_event.is_set()):
+                outcome = controller.run_once(manual_tile_id if first else None,
+                                              manual_expected if first else None)
+                while True:
+                    try:
+                        self.step_results.put(outcome, timeout=.1)
+                        break
+                    except Full:
+                        if controller.stop_event.is_set():
+                            return
+                first = False
+                if not outcome.success:
+                    break
 
-        Thread(target=worker, daemon=True).start()
-        self.root.after(100, self._poll_step)
+        self.step_thread = Thread(target=worker, daemon=True)
+        self.step_thread.start()
+        self.root.after(50, self._poll_step)
 
     def _poll_step(self) -> None:
         try:
             outcome = self.step_results.get_nowait()
         except Empty:
-            self.root.after(100, self._poll_step)
+            if self.step_thread is not None and self.step_thread.is_alive():
+                self.root.after(50, self._poll_step)
+            else:
+                self.step_active = False
             return
-        self.step_active = False
         self._apply_outcome(outcome)
-        if self.running and outcome.success:
-            self.root.after(600, self._auto_cycle)
-
-    def _auto_cycle(self) -> None:
-        if not self.running or self.controller is None or self.controller.stop_event.is_set():
-            return
-        self._start_step(self.controller)
+        self.root.after(50, self._poll_step)
 
     def pause(self) -> None:
         self.running = False

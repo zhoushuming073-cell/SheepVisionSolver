@@ -61,14 +61,22 @@ class BasicPlanner:
         if paired:
             selected = self._select(paired)
             return Decision(labels, self._action(selected, observation, "与卡槽已有牌配对"), "与卡槽已有牌配对")
-        if not observation.tray:
-            visible_counts = Counter(tile.type_id for tile in candidates)
-            triple = [tile for tile in candidates if visible_counts[tile.type_id] >= 3]
-            if triple:
-                selected = self._select(triple)
-                return Decision(labels, self._action(selected, observation, "当前可见同类牌至少三张"),
-                                "当前可见同类牌至少三张")
-        return Decision(labels, None, "缺少可验证的安全配对")
+        visible_counts = Counter(tile.type_id for tile in candidates)
+        triple = [tile for tile in candidates if visible_counts[tile.type_id] >= 3]
+        if triple:
+            selected = self._select(triple)
+            return Decision(labels, self._action(selected, observation, "当前可见同类牌至少三张"),
+                            "当前可见同类牌至少三张")
+        # A single unmatched card is a bounded risk while there is ample room.
+        # Prefer a visible pair; never spend the final two slots speculatively.
+        if len(observation.tray) <= self.tray_capacity - 3:
+            ranked = sorted(candidates, key=lambda tile: (
+                -visible_counts[tile.type_id], -tile.clickable_confidence,
+                -tile.confidence, tile.y, tile.x, tile.id))
+            selected = ranked[0]
+            reason = "卡槽空间充足；选择当前可见同类较多的牌"
+            return Decision(labels, self._action(selected, observation, reason), reason)
+        return Decision(labels, None, "卡槽空间不足以安全尝试新类型")
 
     @staticmethod
     def _select(tiles: list[ObservedTile]) -> ObservedTile:

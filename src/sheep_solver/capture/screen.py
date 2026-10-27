@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
@@ -72,6 +72,16 @@ class CapturedFrame:
     region: Region
     timestamp: str
     source: str = "screen"
+    _pixels: object | None = field(default=None, init=False, repr=False, compare=False)
+
+    @property
+    def pixels(self):
+        """One cached RGB array per frame, discarded with the frame."""
+        if self._pixels is None:
+            import numpy as np
+            pixels = np.asarray(self.image if self.image.mode == "RGB" else self.image.convert("RGB"))
+            object.__setattr__(self, "_pixels", pixels)
+        return self._pixels
 
     def to_screen(self, local_x: int, local_y: int) -> tuple[int, int]:
         return self.region.to_screen(local_x, local_y)
