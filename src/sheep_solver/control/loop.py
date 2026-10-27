@@ -14,7 +14,7 @@ from sheep_solver.core.memory import StateConflict, VisibleMemory
 from sheep_solver.core.models import Observation, ObservedTile
 from sheep_solver.planning.basic import Action, BasicPlanner, Decision
 from sheep_solver.vision.detector import TemplateDetector, VisionProfile
-from sheep_solver.vision.frame_diff import changed_fraction
+from sheep_solver.vision.frame_diff import changed_fraction, max_patch_changed_fraction
 
 from .mouse import SafeMouse
 
@@ -37,6 +37,7 @@ class VisualController:
                  stop_event: Event | None = None,
                  capture: Callable[[Region], CapturedFrame] = capture_frame,
                  feedback_timeout: float = 1.6, poll_interval: float = .04,
+                 settle_seconds: float = .12,
                  animation_delay: float | None = None,
                  log_path: str | Path = "data/logs/actions.jsonl"):
         self.detector = detector
@@ -48,6 +49,7 @@ class VisualController:
         self.capture = capture
         self.feedback_timeout = feedback_timeout
         self.poll_interval = poll_interval
+        self.settle_seconds = settle_seconds
         self.log_path = Path(log_path)
         self.memory: VisibleMemory | None = None
         self.last_frame: CapturedFrame | None = None
@@ -105,12 +107,18 @@ class VisualController:
         return Region(left, top, right - left, bottom - top)
 
     def _wait_for_feedback(self, before: CapturedFrame, tile: ObservedTile,
+                           expected_occupancy: int,
                            metrics: dict[str, float | int]) -> tuple[CapturedFrame, bool]:
         target_region = self._tile_region(tile, self.profile.board)
+        board, tray = self.profile.board, self.profile.tray
+        travel_region = Region(min(board.left, tray.left), min(board.top, tray.top),
+                               max(board.right, tray.right) - min(board.left, tray.left),
+                               max(board.bottom, tray.bottom) - min(board.top, tray.top))
         deadline = time.monotonic() + self.feedback_timeout
         previous = before
         changed = False
         quiet = 0
+        quiet_since: float | None = None
         while time.monotonic() < deadline and not self.stop_event.is_set():
             if self.stop_event.wait(self.poll_interval):
                 break
@@ -119,11 +127,15 @@ class VisualController:
             tray_delta = changed_fraction(before, current, self.profile.tray, stride=4)
             changed = changed or target_delta > .05 or tray_delta > .015
             if changed:
-                motion = max(changed_fraction(previous, current, target_region, stride=2),
-                             changed_fraction(previous, current, self.profile.tray, stride=4))
-                quiet = quiet + 1 if motion < .012 else 0
-                if quiet >= 1:
-                    return current, True
+                motion = max_patch_changed_fraction(previous, current, travel_region)
+                if motion < .02 and self.detector.tray_card_count(current, self.profile) == expected_occupancy:
+                    quiet += 1
+                    quiet_since = quiet_since or time.monotonic()
+                    if quiet >= 2 and time.monotonic() - quiet_since >= self.settle_seconds:
+                        return current, True
+                else:
+                    quiet = 0
+                    quiet_since = None
             previous = current
         return previous, False
 
@@ -188,11 +200,15 @@ class VisualController:
         fresh = self._capture(metrics)
         if (changed_fraction(self.last_frame, fresh, self.profile.board) > .03 or
                 changed_fraction(self.last_frame, fresh, self.profile.tray) > .03):
-            after = self._resync(fresh, metrics)
-            return StepOutcome(False, "点击前画面变化，已重新同步", decision, before, after, fresh)
+            self.memory = None
+            self.last_frame = None
+            return StepOutcome(False, "点击前画面变化；已暂停，待稳定后重新识别", decision,
+                               before, after_frame=fresh)
         if not self.detector.confirm_target(fresh, self.profile, target):
-            after = self._resync(fresh, metrics)
-            return StepOutcome(False, "点击前目标牌验证失败，已重新同步", decision, before, after, fresh)
+            self.memory = None
+            self.last_frame = None
+            return StepOutcome(False, "点击前目标牌验证失败；已暂停，待稳定后重新识别", decision,
+                               before, after_frame=fresh)
         metrics["preclick_ms"] = (time.perf_counter() - preclick_started) * 1000
 
         self.memory.begin_click(target.id, target.type_id)
@@ -204,7 +220,9 @@ class VisualController:
             self.last_frame = None
             raise
         feedback_started = time.perf_counter()
-        after_frame, confirmed = self._wait_for_feedback(fresh, target, metrics)
+        expected_tray = self.memory.pending.expected_tray
+        after_frame, confirmed = self._wait_for_feedback(fresh, target,
+                                                         len(expected_tray), metrics)
         metrics["feedback_ms"] = (time.perf_counter() - feedback_started) * 1000
         if self.stop_event.is_set():
             self.memory.abort_click()
@@ -212,13 +230,18 @@ class VisualController:
             self.last_frame = None
             return StepOutcome(False, "点击后收到停止命令；下次需重新同步", decision, before,
                                after_frame=after_frame)
-        if not confirmed or self.detector.confirm_target(after_frame, self.profile, target):
+        if not confirmed:
+            self.memory.abort_click()
+            self.memory = None
+            self.last_frame = None
+            return StepOutcome(False, "点击反馈未稳定；停止并等待下次完整同步", decision,
+                               before, after_frame=after_frame)
+        if self.detector.confirm_target(after_frame, self.profile, target):
             self.memory.abort_click()
             after = self._resync(after_frame, metrics)
             return StepOutcome(False, "点击反馈未确认，已重新同步并停止", decision, before,
                                after, after_frame)
 
-        expected_tray = self.memory.pending.expected_tray
         affected = self._affected_region(target, self.profile.board)
         local_started = time.perf_counter()
         local_tiles = self.detector.detect_board_region(after_frame, self.profile, affected)

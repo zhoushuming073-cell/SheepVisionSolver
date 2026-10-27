@@ -44,6 +44,7 @@ class SheepApp:
         self.hotkey_event = Event()
         self.mouse = SafeMouse(stop_event=self.stop_event)
         self.running = False
+        self.needs_manual_sync = False
         self.step_active = False
         self.step_thread: Thread | None = None
         self.step_results: Queue[StepOutcome] = Queue(maxsize=2)
@@ -313,6 +314,7 @@ class SheepApp:
             self._status(f"识别失败：{error}")
             return
         self.observation = observation
+        self.needs_manual_sync = False
         debug_image = draw_debug(self.frame.image, observation)
         self._show_preview(debug_image)
         self._update_tile_list(observation)
@@ -333,6 +335,9 @@ class SheepApp:
     def _new_controller(self) -> VisualController | None:
         if self.step_active or self.recognition_active:
             self._status("当前一步仍在识别或验证，请等待其结束")
+            return None
+        if self.needs_manual_sync:
+            self._status("画面状态未确认；请等动画结束后重新获取截图并识别")
             return None
         profile = self._profile()
         if profile is None or self.game_region is None or self.frame is None or self.frame.source != "screen":
@@ -356,6 +361,13 @@ class SheepApp:
 
     def _apply_outcome(self, outcome: StepOutcome) -> None:
         self._status(f"{outcome.reason}；决策：{outcome.decision.reason}；目标：{outcome.decision.action}")
+        if not outcome.success and ("未稳定" in outcome.reason or
+                                    "点击前画面变化" in outcome.reason or
+                                    "目标牌验证失败" in outcome.reason):
+            self.controller = None
+            self.frame = None
+            self.observation = None
+            self.needs_manual_sync = True
         if outcome.after_frame and outcome.after:
             self.frame = outcome.after_frame
             self.observation = outcome.after

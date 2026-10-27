@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from itertools import chain, cycle, repeat
 from pathlib import Path
 from threading import Event, Thread
 
@@ -96,7 +97,7 @@ def test_one_step_reobserves_and_logs(tmp_path: Path):
     ImageDraw.Draw(after_image).rectangle((10, 10, 45, 45), fill="white")
     before_frame = CapturedFrame(before_image, region, "before")
     after_frame = CapturedFrame(after_image, region, "after")
-    frames = iter((before_frame, before_frame, after_frame, after_frame, after_frame))
+    frames = chain((before_frame, before_frame), repeat(after_frame))
     before = _obs((_tile("a", "1", 10, 10), _tile("b", "1", 60, 10),
                    _tile("c", "1", 110, 10)))
     after = _obs((_tile("b", "1", 60, 10), _tile("c", "1", 110, 10)), ("1",))
@@ -120,6 +121,7 @@ def test_one_step_reobserves_and_logs(tmp_path: Path):
                                                              Region(0, 130, 200, 60)), region,
                                   mouse=SafeMouse(backend, min_interval=0),
                                   capture=lambda _region: next(frames), poll_interval=.001,
+                                  settle_seconds=.005,
                                   log_path=log_path)
     outcome = controller.run_once()
     assert outcome.success
@@ -179,9 +181,102 @@ def test_unconfirmed_click_keeps_tray_and_requires_resync(tmp_path: Path):
     outcome = controller.run_once()
     assert backend.clicks == [(125, 225)]
     assert not outcome.success
-    assert outcome.after and outcome.after.tray == ("1", "1")
-    assert controller.memory and controller.memory.tray == ("1", "1")
-    assert controller.memory.pending is None
+    assert outcome.after is None
+    assert controller.memory is None
+    assert "未稳定" in outcome.reason
+
+
+def test_flying_tile_crosses_other_tiles_before_local_recognition(tmp_path: Path):
+    region = Region(100, 200, 200, 200)
+    before_image = Image.new("RGB", (200, 200), "black")
+    ImageDraw.Draw(before_image).rectangle((10, 10, 39, 39), fill="white")
+    settled_image = Image.new("RGB", (200, 200), "black")
+    ImageDraw.Draw(settled_image).rectangle((20, 140, 49, 169), fill="white")
+
+    def moving_frame(x: int, y: int, name: str) -> CapturedFrame:
+        image = settled_image.copy()
+        ImageDraw.Draw(image).rectangle((x, y, x + 29, y + 29), fill="white")
+        return CapturedFrame(image, region, name)
+
+    before_frame = CapturedFrame(before_image, region, "before")
+    moving1 = moving_frame(90, 50, "moving1")
+    moving2 = moving_frame(130, 70, "moving2")
+    moving3 = moving_frame(65, 95, "moving3")
+    settled = CapturedFrame(settled_image, region, "settled")
+    frames = chain((before_frame, before_frame, moving1, moving2,
+                    moving2, moving2, moving2, moving3), repeat(settled))
+    before = _obs((_tile("a", "1", 10, 10), _tile("b", "1", 60, 10),
+                   _tile("c", "1", 110, 10)))
+    recognized_at = []
+
+    class Detector:
+        def detect(self, _frame, _profile):
+            return before
+
+        def confirm_target(self, frame, _profile, _tile):
+            return frame.timestamp == "before"
+
+        def tray_card_count(self, _frame, _profile):
+            return 1  # Occupancy alone cannot prove the card stopped flying.
+
+        def detect_board_region(self, frame, _profile, _region):
+            recognized_at.append(frame.timestamp)
+            return ()
+
+    controller = VisualController(Detector(), VisionProfile(Region(0, 0, 200, 120),
+                                                             Region(0, 130, 200, 60)), region,
+                                  mouse=SafeMouse(FakeMouseBackend(), min_interval=0),
+                                  capture=lambda _region: next(frames),
+                                  poll_interval=.002, settle_seconds=.025,
+                                  feedback_timeout=.3,
+                                  log_path=tmp_path / "actions.jsonl")
+    outcome = controller.run_once()
+    assert outcome.success
+    assert outcome.after_frame and outcome.after_frame.timestamp == "settled"
+    assert recognized_at == ["settled"]
+    assert outcome.after and outcome.after.tray == ("1",)
+
+
+def test_animation_timeout_does_not_resync_from_moving_frame(tmp_path: Path):
+    region = Region(100, 200, 200, 200)
+    before_image = Image.new("RGB", (200, 200), "black")
+    ImageDraw.Draw(before_image).rectangle((10, 10, 39, 39), fill="white")
+    before_frame = CapturedFrame(before_image, region, "before")
+
+    def in_flight(x: int) -> CapturedFrame:
+        image = Image.new("RGB", (200, 200), "black")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((20, 140, 49, 169), fill="white")
+        draw.rectangle((x, 70, x + 29, 99), fill="white")
+        return CapturedFrame(image, region, f"moving{x}")
+
+    frames = chain((before_frame, before_frame), cycle((in_flight(80), in_flight(130))))
+    before = _obs((_tile("a", "1", 10, 10),), ("1", "1"))
+    detects = []
+
+    class Detector:
+        def detect(self, frame, _profile):
+            detects.append(frame.timestamp)
+            return before
+
+        def confirm_target(self, frame, _profile, _tile):
+            return frame.timestamp == "before"
+
+        def tray_card_count(self, _frame, _profile):
+            return 0  # Third matching tile will eventually clear the tray.
+
+    controller = VisualController(Detector(), VisionProfile(Region(0, 0, 200, 120),
+                                                             Region(0, 130, 200, 60)), region,
+                                  mouse=SafeMouse(FakeMouseBackend(), min_interval=0),
+                                  capture=lambda _region: next(frames),
+                                  poll_interval=.002, settle_seconds=.02,
+                                  feedback_timeout=.04,
+                                  log_path=tmp_path / "actions.jsonl")
+    outcome = controller.run_once()
+    assert not outcome.success and "未稳定" in outcome.reason
+    assert detects == ["before"]
+    assert controller.memory is None
+    assert outcome.after is None
 
 
 def test_controller_rejects_wrong_stable_manual_id(tmp_path: Path):

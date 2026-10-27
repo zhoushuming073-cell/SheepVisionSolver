@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import chain, repeat
 import statistics
 import tempfile
 import time
@@ -81,11 +82,12 @@ def main() -> None:
             detector.detect(before, profile)
             full.append((time.perf_counter() - started) * 1000)
         for index in range(40):
-            frames = iter((before, after, after))
+            frames = chain((before,), repeat(after))
             controller = VisualController(detector, profile, before.region,
                                           mouse=SafeMouse(_FakeMouse(), min_interval=0),
                                           capture=lambda _region: next(frames),
                                           poll_interval=.001, feedback_timeout=.2,
+                                          settle_seconds=.01,
                                           log_path=folder / "actions.jsonl")
             controller.initialize_from_observation(before, initial)
             outcome = controller.run_once()
