@@ -28,6 +28,32 @@ CALIBRATION = ROOT / "data" / "calibration.json"
 LOG_PATH = ROOT / "data" / "logs" / "actions.jsonl"
 
 
+def nonoverlap_position(game: Region, window: Region, screen: Region,
+                        margin: int = 24) -> tuple[int, int] | None:
+    """Place a control window outside the physical-pixel capture region."""
+    if window.width > screen.width or window.height > screen.height:
+        return None
+    intersects = (window.left < game.right and window.right > game.left and
+                  window.top < game.bottom and window.bottom > game.top)
+    if not intersects:
+        return window.left, window.top
+    y = max(screen.top, min(window.top, screen.bottom - window.height))
+    x_right = game.right + margin
+    if x_right + window.width <= screen.right:
+        return x_right, y
+    x_left = game.left - window.width - margin
+    if x_left >= screen.left:
+        return x_left, y
+    x = max(screen.left, min(window.left, screen.right - window.width))
+    y_below = game.bottom + margin
+    if y_below + window.height <= screen.bottom:
+        return x, y_below
+    y_above = game.top - window.height - margin
+    if y_above >= screen.top:
+        return x, y_above
+    return None
+
+
 class SheepApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -58,6 +84,7 @@ class SheepApp:
         self.list_ids: list[str] = []
         self._build()
         self._load_calibration()
+        self.root.after(0, self._move_off_game)
         self.hotkeys = None
         try:
             from pynput.keyboard import GlobalHotKeys
@@ -111,6 +138,23 @@ class SheepApp:
 
     def _status(self, text: str) -> None:
         self.status_var.set(text)
+
+    def _move_off_game(self) -> str:
+        if self.game_region is None:
+            return "clear"
+        self.root.update_idletasks()
+        window = Region(self.root.winfo_rootx(), self.root.winfo_rooty(),
+                        max(1, self.root.winfo_width()), max(1, self.root.winfo_height()))
+        destination = nonoverlap_position(self.game_region, window, virtual_screen())
+        if destination is None:
+            self._status("控制窗口与游戏截图区域重叠，桌面没有足够空间；请调整游戏区域")
+            return "blocked"
+        if destination == (window.left, window.top):
+            return "clear"
+        self.root.geometry(f"+{destination[0]}+{destination[1]}")
+        self.root.update_idletasks()
+        self._status("已将控制窗口移出游戏区域；请重新获取截图")
+        return "moved"
 
     def _load_calibration(self) -> None:
         if not CALIBRATION.exists():
@@ -169,6 +213,12 @@ class SheepApp:
             return
         if self.game_region is None:
             self._status("请先选择游戏区域")
+            return
+        placement = self._move_off_game()
+        if placement == "blocked":
+            return
+        if placement == "moved":
+            self.root.after(200, self.capture)
             return
         try:
             self.frame = capture_frame(self.game_region)
@@ -314,6 +364,7 @@ class SheepApp:
             self._status(f"识别失败：{error}")
             return
         self.observation = observation
+        self.controller = None  # Manual recognition is an explicit state resync.
         self.needs_manual_sync = False
         debug_image = draw_debug(self.frame.image, observation)
         self._show_preview(debug_image)
@@ -338,6 +389,9 @@ class SheepApp:
             return None
         if self.needs_manual_sync:
             self._status("画面状态未确认；请等动画结束后重新获取截图并识别")
+            return None
+        if self._move_off_game() != "clear":
+            self._status("控制窗口已移动；请重新获取截图并识别后再点击")
             return None
         profile = self._profile()
         if profile is None or self.game_region is None or self.frame is None or self.frame.source != "screen":

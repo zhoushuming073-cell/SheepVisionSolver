@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from dataclasses import replace
 from itertools import chain, cycle, repeat
 from pathlib import Path
 from threading import Event, Thread
@@ -36,6 +37,20 @@ def test_basic_planner_triple_pair_and_safe_stop():
     assert planner.decide(_obs((_tile("a", "1", 10, 10),))).action is not None
     assert planner.decide(_obs((_tile("a", "1", 10, 10),),
                                ("2", "3", "4", "5", "6"))).action is None
+
+
+def test_near_full_planner_only_tries_a_known_unlock():
+    planner = BasicPlanner()
+    hidden_pair = replace(_tile("covered", "w", 10, 10), clickable=False,
+                          visibility="partial")
+    blocker = _tile("blocker", "s", 10, 34)
+    unrelated = _tile("other", "s", 90, 34)
+    tray = ("w", "w", "g", "g", "s")
+    decision = planner.decide(_obs((hidden_pair, blocker, unrelated), tray))
+    assert decision.action and decision.action.tile_id == "blocker"
+    assert "余两格" in decision.reason
+    assert planner.decide(_obs((hidden_pair, blocker, unrelated), (*tray, "z"))).action is None
+    assert planner.decide(_obs((hidden_pair, _tile("new", "z", 10, 34)), tray)).action is None
 
 
 class FakeMouseBackend:

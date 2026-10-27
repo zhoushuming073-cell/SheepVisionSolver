@@ -56,6 +56,11 @@ class BasicPlanner:
             selected = self._select(immediate)
             return Decision(labels, self._action(selected, observation, "直接完成三消"), "直接完成三消")
         if len(observation.tray) >= self.tray_capacity - 2:
+            if len(observation.tray) == self.tray_capacity - 2:
+                unlock = self._near_full_unlock(candidates, observation.tiles, counts)
+                if unlock is not None:
+                    reason = "卡槽余两格；尝试移开遮挡已成对牌的方块"
+                    return Decision(labels, self._action(unlock, observation, reason), reason)
             return Decision(labels, None, "卡槽接近满格且没有直接三消")
         paired = [tile for tile in candidates if counts[tile.type_id] == 1]
         if paired:
@@ -77,6 +82,32 @@ class BasicPlanner:
             reason = "卡槽空间充足；选择当前可见同类较多的牌"
             return Decision(labels, self._action(selected, observation, reason), reason)
         return Decision(labels, None, "卡槽空间不足以安全尝试新类型")
+
+    def _near_full_unlock(self, candidates: tuple[ObservedTile, ...],
+                          all_tiles: tuple[ObservedTile, ...],
+                          tray_counts: Counter[str]) -> ObservedTile | None:
+        """Spend only the sixth slot to expose a known potential immediate match."""
+        hidden_pairs = [tile for tile in all_tiles
+                        if tile.region == "main" and tile.visibility == "partial" and
+                        tile.type_id is not None and tile.confidence >= self.min_confidence and
+                        tray_counts[tile.type_id] >= 2]
+        ranked: list[tuple[float, ObservedTile]] = []
+        for candidate in candidates:
+            if tray_counts[candidate.type_id] < 1:
+                continue  # Do not add a new unmatched type with only two slots left.
+            for hidden in hidden_pairs:
+                overlap_w = max(0.0, min(candidate.x + candidate.width,
+                                         hidden.x + hidden.width) - max(candidate.x, hidden.x))
+                overlap_h = max(0.0, min(candidate.y + candidate.height,
+                                         hidden.y + hidden.height) - max(candidate.y, hidden.y))
+                overlap = overlap_w * overlap_h / min(candidate.width * candidate.height,
+                                                      hidden.width * hidden.height)
+                if overlap >= .05:
+                    ranked.append((overlap * hidden.confidence, candidate))
+        if not ranked:
+            return None
+        best = max(score for score, _ in ranked)
+        return self._select([tile for score, tile in ranked if score == best])
 
     @staticmethod
     def _select(tiles: list[ObservedTile]) -> ObservedTile:
