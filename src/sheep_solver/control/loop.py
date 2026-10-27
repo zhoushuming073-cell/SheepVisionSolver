@@ -117,6 +117,7 @@ class VisualController:
         deadline = time.monotonic() + self.feedback_timeout
         previous = before
         changed = False
+        first_changed_at: float | None = None
         quiet = 0
         quiet_since: float | None = None
         while time.monotonic() < deadline and not self.stop_event.is_set():
@@ -127,11 +128,14 @@ class VisualController:
             tray_delta = changed_fraction(before, current, self.profile.tray, stride=4)
             changed = changed or target_delta > .05 or tray_delta > .015
             if changed:
+                first_changed_at = first_changed_at or time.monotonic()
                 motion = max_patch_changed_fraction(previous, current, travel_region)
                 if motion < .02 and self.detector.tray_card_count(current, self.profile) == expected_occupancy:
                     quiet += 1
                     quiet_since = quiet_since or time.monotonic()
-                    if quiet >= 2 and time.monotonic() - quiet_since >= self.settle_seconds:
+                    # A travelling card can pause for several frames mid-flight.
+                    if (quiet >= 3 and time.monotonic() - quiet_since >= self.settle_seconds
+                            and time.monotonic() - first_changed_at >= .15):
                         return current, "settled"
                 else:
                     quiet = 0
