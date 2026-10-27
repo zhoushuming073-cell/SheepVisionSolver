@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+third_party/
+data/research/
+data/screenshots/
+data/logs/
+data/calibration.json
+assets/tiles/
+build/
+dist/
+*.spec
+

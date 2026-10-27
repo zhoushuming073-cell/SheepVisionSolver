@@ -1,0 +1,2 @@
+"""SheepVisionSolver research scaffold."""
+

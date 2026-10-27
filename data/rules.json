@@ -1,0 +1,8 @@
+{
+  "mode": "daily_challenge",
+  "evidence_status": "hypothesis",
+  "match_size": 3,
+  "tray_capacity": 7,
+  "notes": "Only for hand-built test levels. Not validated against the real game."
+}
+
