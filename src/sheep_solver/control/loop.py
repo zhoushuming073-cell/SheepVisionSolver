@@ -108,7 +108,7 @@ class VisualController:
 
     def _wait_for_feedback(self, before: CapturedFrame, tile: ObservedTile,
                            expected_occupancy: int,
-                           metrics: dict[str, float | int]) -> tuple[CapturedFrame, bool]:
+                           metrics: dict[str, float | int]) -> tuple[CapturedFrame, str]:
         target_region = self._tile_region(tile, self.profile.board)
         board, tray = self.profile.board, self.profile.tray
         travel_region = Region(min(board.left, tray.left), min(board.top, tray.top),
@@ -132,12 +132,12 @@ class VisualController:
                     quiet += 1
                     quiet_since = quiet_since or time.monotonic()
                     if quiet >= 2 and time.monotonic() - quiet_since >= self.settle_seconds:
-                        return current, True
+                        return current, "settled"
                 else:
                     quiet = 0
                     quiet_since = None
             previous = current
-        return previous, False
+        return previous, "moving" if changed else "unchanged"
 
     def _manual_decision(self, before: Observation, manual_id: str,
                          expected: tuple[str, int, int] | None,
@@ -221,8 +221,8 @@ class VisualController:
             raise
         feedback_started = time.perf_counter()
         expected_tray = self.memory.pending.expected_tray
-        after_frame, confirmed = self._wait_for_feedback(fresh, target,
-                                                         len(expected_tray), metrics)
+        after_frame, feedback_state = self._wait_for_feedback(fresh, target,
+                                                              len(expected_tray), metrics)
         metrics["feedback_ms"] = (time.perf_counter() - feedback_started) * 1000
         if self.stop_event.is_set():
             self.memory.abort_click()
@@ -230,11 +230,13 @@ class VisualController:
             self.last_frame = None
             return StepOutcome(False, "点击后收到停止命令；下次需重新同步", decision, before,
                                after_frame=after_frame)
-        if not confirmed:
+        if feedback_state != "settled":
             self.memory.abort_click()
             self.memory = None
             self.last_frame = None
-            return StepOutcome(False, "点击反馈未稳定；停止并等待下次完整同步", decision,
+            reason = ("点击未生效；目标与卡槽没有可确认变化" if feedback_state == "unchanged"
+                      else "点击后动画未稳定；停止并等待下次完整同步")
+            return StepOutcome(False, reason, decision,
                                before, after_frame=after_frame)
         if self.detector.confirm_target(after_frame, self.profile, target):
             self.memory.abort_click()

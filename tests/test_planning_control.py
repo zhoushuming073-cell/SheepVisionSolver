@@ -198,7 +198,7 @@ def test_unconfirmed_click_keeps_tray_and_requires_resync(tmp_path: Path):
     assert not outcome.success
     assert outcome.after is None
     assert controller.memory is None
-    assert "未稳定" in outcome.reason
+    assert "点击未生效" in outcome.reason
 
 
 def test_flying_tile_crosses_other_tiles_before_local_recognition(tmp_path: Path):
