@@ -68,11 +68,13 @@ class VisibleMemory:
         self.tiles: dict[str, ObservedTile] = {}
         self.next_id = 1
         self.tray = tuple(observation.tray)
+        self.piles = tuple(observation.piles)
         self.status = observation.status
         self.game_region = observation.game_region
         self.screenshot_size = observation.screenshot_size
         self.timestamp = observation.timestamp
         self.pending: PendingClick | None = None
+        self._partial_misses: dict[str, int] = {}
         for tile in sorted(observation.tiles, key=lambda item: (item.y, item.x, item.type_id or "")):
             self._add(tile)
 
@@ -95,7 +97,7 @@ class VisibleMemory:
         return Counter(tile.type_id for tile in self.tiles.values() if tile.type_id is not None)
 
     def observation(self) -> Observation:
-        return Observation(tuple(self.tiles.values()), (), self.tray, self.status,
+        return Observation(tuple(self.tiles.values()), self.piles, self.tray, self.status,
                            self.game_region, self.screenshot_size, self.timestamp)
 
     def begin_click(self, tile_id: str, type_id: str) -> PendingClick:
@@ -116,8 +118,10 @@ class VisibleMemory:
         if clicked_id is not None and clicked_id not in self.tiles:
             raise StateConflict("Clicked tile identity is stale")
         updated = dict(self.tiles)
+        partial_misses = dict(self._partial_misses)
         if clicked_id is not None:
             del updated[clicked_id]
+            partial_misses.pop(clicked_id, None)
         available = {tile_id for tile_id, tile in updated.items() if _touches(tile, region)}
         incoming = sorted(detected, key=lambda item: (-item.confidence, item.y, item.x))
         for observed in incoming:
@@ -135,6 +139,7 @@ class VisibleMemory:
                         previous.type_id != observed.type_id):
                     raise StateConflict(f"Tile {tile_id} changed type unexpectedly")
                 available.remove(tile_id)
+                partial_misses.pop(tile_id, None)
                 updated[tile_id] = replace(observed, id=tile_id,
                                            type_id=observed.type_id or previous.type_id)
             else:
@@ -145,7 +150,18 @@ class VisibleMemory:
                         if updated[tile_id].visibility == "full" and _contained(updated[tile_id], region)]
         if missing_full:
             raise StateConflict(f"Previously full tiles disappeared: {missing_full}")
+        for tile_id in available:
+            old = updated[tile_id]
+            if old.visibility != "partial" or not _contained(old, region):
+                continue
+            misses = partial_misses.get(tile_id, 0) + 1
+            if misses >= 2:
+                del updated[tile_id]
+                partial_misses.pop(tile_id, None)
+            else:
+                partial_misses[tile_id] = misses
         self.tiles = updated
+        self._partial_misses = partial_misses
         self.timestamp = timestamp or self.timestamp
 
     def commit_click(self, detected: tuple[ObservedTile, ...], region: Region,
@@ -158,11 +174,13 @@ class VisibleMemory:
             raise StateConflict("Click was not confirmed")
         previous_tiles = self.tiles
         previous_next_id = self.next_id
+        previous_partial_misses = self._partial_misses
         try:
             self.merge(detected, region, clicked_id=pending.tile_id, timestamp=timestamp)
         except Exception:
             self.tiles = previous_tiles
             self.next_id = previous_next_id
+            self._partial_misses = previous_partial_misses
             self.pending = None
             raise
         self.tray = pending.expected_tray

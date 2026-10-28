@@ -13,7 +13,8 @@ import numpy as np
 from PIL import Image
 
 from sheep_solver.capture.screen import CapturedFrame, Region
-from sheep_solver.core.models import Observation, ObservedTile
+from sheep_solver.core.models import Observation, ObservedPile, ObservedTile
+from .occlusion import apply_black_mask, masked_similarity, visible_mask
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,8 @@ class VisionProfile:
     click_threshold: float = 0.94
     ambiguity_margin: float = 0.025
     border_error_limit: float = 55.0
+    left_pile: Region | None = None
+    right_pile: Region | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +49,7 @@ class _Candidate:
     width: int
     height: int
     score: float
+    shade_state: str = "unknown"
 
     @property
     def center(self) -> tuple[float, float]:
@@ -94,6 +98,32 @@ class TemplateDetector:
             for name in ("block_bg.png", "block_bg_change.png", "block_bg_gold.png")
             if (folder / name).exists()
         )
+        mask_record = next((record for record in manifest["records"]
+                            if record["file"] == "blackMask.png"), None)
+        self._black_alpha: np.ndarray | None = None
+        if mask_record is not None and (folder / "blackMask.png").exists():
+            cropped = np.array(Image.open(folder / "blackMask.png").convert("RGBA"))[:, :, 3]
+            original = mask_record["original_size"]
+            offset = mask_record.get("offset", [0, 0])
+            x = round((original[0] - cropped.shape[1]) / 2 + offset[0])
+            y = round((original[1] - cropped.shape[0]) / 2 - offset[1])
+            alpha = np.zeros((original[1], original[0]), dtype=np.uint8)
+            alpha[y:y + cropped.shape[0], x:x + cropped.shape[1]] = cropped
+            self._black_alpha = alpha
+
+    @lru_cache(maxsize=32)
+    def _scaled_black_alpha(self, width: int, height: int) -> np.ndarray:
+        assert self._black_alpha is not None
+        return cv2.resize(self._black_alpha, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    @lru_cache(maxsize=128)
+    def _dark_icon(self, type_id: str, icon_w: int, icon_h: int,
+                   card_w: int, card_h: int, inset_x: int,
+                   inset_y: int) -> tuple[np.ndarray, np.ndarray, int]:
+        icon, alpha = self._scaled_template(type_id, icon_w, icon_h)
+        black = self._scaled_black_alpha(card_w, card_h)
+        shade = black[inset_y:inset_y + icon_h, inset_x:inset_x + icon_w]
+        return apply_black_mask(icon, shade), alpha, cv2.countNonZero(alpha)
 
     @lru_cache(maxsize=128)
     def _scaled_template(self, type_id: str, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
@@ -156,7 +186,9 @@ class TemplateDetector:
             selected.append(best)
         return selected
 
-    def _border_error(self, rgb: np.ndarray, candidate: _Candidate) -> float:
+    def _border_error(self, rgb: np.ndarray, candidate: _Candidate,
+                      *, dark: bool = False,
+                      visible: np.ndarray | None = None) -> float:
         x, y, w, h = candidate.x, candidate.y, candidate.width, candidate.height
         if x < 0 or y < 0 or x + w > rgb.shape[1] or y + h > rgb.shape[0]:
             return 255.0
@@ -164,15 +196,99 @@ class TemplateDetector:
         errors: list[float] = []
         for index in range(len(self.backgrounds)):
             image = self._scaled_background(index, w, h)
+            expected = (apply_black_mask(image[:, :, :3], self._scaled_black_alpha(w, h))
+                        if dark and self._black_alpha is not None else image[:, :, :3])
             edge = np.zeros((h, w), dtype=bool)
             edge[:max(3, h // 10)] = True
             edge[-max(3, h // 7):] = True
             edge[:, :max(3, w // 12)] = True
             edge[:, -max(3, w // 12):] = True
             edge &= image[:, :, 3] > 100
+            if visible is not None:
+                edge &= visible
             if edge.any():
-                errors.append(float(np.abs(target[edge] - image[:, :, :3][edge]).mean()))
+                errors.append(float(np.abs(target[edge] - expected[edge]).mean()))
         return min(errors, default=255.0)
+
+    def _shade(self, rgb: np.ndarray, candidate: _Candidate,
+               border_limit: float) -> tuple[str, float]:
+        normal = self._border_error(rgb, candidate)
+        if self._black_alpha is None:
+            return ("normal" if normal <= border_limit else "unknown"), normal
+        dark = self._border_error(rgb, candidate, dark=True)
+        if dark + 7 < normal and dark <= border_limit:
+            return "dark", dark
+        if normal <= border_limit:
+            return "normal", normal
+        return "unknown", min(normal, dark)
+
+    def _partial_candidates(self, rgb: np.ndarray, roi: Region,
+                            seeds: list[_Candidate], profile: VisionProfile) -> list[_Candidate]:
+        """Classify dark cards at geometry proposed by observed nearby cards.
+
+        The half-card shifts are search hypotheses, not assertions about level
+        generation. Candidates must fit visible icon pixels and stay unclickable.
+        """
+        if self._black_alpha is None or not seeds:
+            return []
+        bright = [item for item in seeds if self._shade(rgb, item, profile.border_error_limit)[0] == "normal"
+                  and item.score >= profile.click_threshold]
+        if not bright:
+            return []
+        blockers = tuple((item.x, item.y, item.width, item.height) for item in bright)
+        positions: dict[tuple[int, int, int, int], None] = {}
+        for seed in bright:
+            # APK row/column positions use the same cell pitch; card art is taller.
+            dx = dy = round(seed.width / 2)
+            for sx, sy in ((-dx, 0), (dx, 0), (0, -dy), (0, dy),
+                           (-dx, -dy), (-dx, dy), (dx, -dy), (dx, dy)):
+                x, y = seed.x + sx, seed.y + sy
+                if (x < profile.board.left or y < profile.board.top or
+                        x + seed.width > profile.board.right or
+                        y + seed.height > profile.board.bottom or
+                        x >= roi.right or y >= roi.bottom or
+                        x + seed.width <= roi.left or y + seed.height <= roi.top):
+                    continue
+                probe = _Candidate("unknown", x, y, seed.width, seed.height, 0.0)
+                if any(_point_near(probe, old) for old in seeds):
+                    continue
+                positions[(x, y, seed.width, seed.height)] = None
+        output: list[_Candidate] = []
+        for x, y, w, h in positions:
+            exposed = visible_mask(x, y, w, h, blockers)
+            occlusion = 1.0 - float(exposed.mean())
+            if occlusion < .08 or occlusion > .85:
+                continue
+            matches: list[tuple[float, float, str]] = []
+            for template in self.templates:
+                scale = w / template.original_width
+                icon_w, icon_h = round(template.rgba.shape[1] * scale), round(template.rgba.shape[0] * scale)
+                ix, iy = x + round(template.inset_x * scale), y + round(template.inset_y * scale)
+                if icon_w < 12 or icon_h < 12 or ix < 0 or iy < 0 or ix + icon_w > rgb.shape[1] or iy + icon_h > rgb.shape[0]:
+                    continue
+                offset_x, offset_y = ix - x, iy - y
+                if offset_x < 0 or offset_y < 0 or offset_x + icon_w > w or offset_y + icon_h > h:
+                    continue
+                expected, alpha, icon_pixels = self._dark_icon(
+                    template.type_id, icon_w, icon_h, w, h, offset_x, offset_y)
+                valid = (alpha > 240) & exposed[offset_y:offset_y + icon_h, offset_x:offset_x + icon_w]
+                if np.count_nonzero(valid) < max(100, int(icon_pixels * .15)):
+                    continue
+                score, error = masked_similarity(rgb[iy:iy + icon_h, ix:ix + icon_w], expected, valid)
+                matches.append((score, error, template.type_id))
+            matches.sort(reverse=True)
+            if not matches:
+                continue
+            score, error, kind = matches[0]
+            runner = max((value[0] for value in matches[1:]), default=-1.0)
+            if score >= .92 and error <= 22 and score - runner > max(.05, profile.ambiguity_margin):
+                output.append(_Candidate(kind, x, y, w, h, score, "dark"))
+        output.sort(key=lambda item: item.score, reverse=True)
+        unique: list[_Candidate] = []
+        for item in output:
+            if not any(_point_near(item, old) for old in (*seeds, *unique)):
+                unique.append(item)
+        return unique
 
     @staticmethod
     def _tray_occupied_count(rgb: np.ndarray, roi: Region) -> int:
@@ -195,19 +311,33 @@ class TemplateDetector:
                         profile: VisionProfile) -> tuple[tuple[ObservedTile, ...], tuple[str, ...]]:
         warnings: list[str] = []
         observed: list[ObservedTile] = []
-        border_errors = [self._border_error(rgb, candidate) for candidate in board]
+        shade_info = [self._shade(rgb, candidate, profile.border_error_limit)
+                      for candidate in board]
+        border_errors = [value[1] for value in shade_info]
         for index, candidate in enumerate(board):
             error = border_errors[index]
+            shade = candidate.shade_state if candidate.shade_state != "unknown" else shade_info[index][0]
+            blockers = tuple((other.x, other.y, other.width, other.height)
+                             for j, other in enumerate(board) if j != index and
+                             shade_info[j][0] == "normal" and
+                             other.score >= profile.click_threshold and
+                             _overlap(candidate, other) > .08)
+            exposed = visible_mask(candidate.x, candidate.y, candidate.width,
+                                   candidate.height, blockers)
+            occlusion_fraction = round(1.0 - float(exposed.mean()), 3) if blockers else 0.0
             overlapping = any(_overlap(candidate, other) > .08 and
+                              shade_info[j][0] != "dark" and
                               border_errors[j] <= profile.border_error_limit and
                               other.score >= candidate.score - .015
                               for j, other in enumerate(board) if index != j)
-            clickable = (candidate.score >= profile.click_threshold and
+            clickable = (shade == "normal" and candidate.score >= profile.click_threshold and
                          candidate.type_id != "unknown" and
                          error <= profile.border_error_limit and not overlapping and
                          profile.board.contains(round(candidate.center[0]), round(candidate.center[1]), margin=3))
             if candidate.type_id == "unknown":
                 click_reason = "type ambiguous"
+            elif shade == "dark":
+                click_reason = "black-mask shade; not clickable"
             elif candidate.score < profile.click_threshold:
                 click_reason = "low icon confidence"
             elif error > profile.border_error_limit:
@@ -224,10 +354,15 @@ class TemplateDetector:
                 id=f"screen-{index}", type_id=None if candidate.type_id == "unknown" else candidate.type_id,
                 x=candidate.x, y=candidate.y, width=candidate.width, height=candidate.height,
                 layer=0, region="main", clickable=clickable, confidence=candidate.score,
-                clickable_confidence=max(0.0, 1.0 - error / 255.0) if not overlapping else 0.0,
+                clickable_confidence=(max(0.0, 1.0 - error / 255.0)
+                                      if shade == "normal" and not overlapping else 0.0),
                 visible_face=candidate.type_id != "unknown",
                 clickability_reason=click_reason,
-                visibility="full" if error <= profile.border_error_limit and not overlapping else "partial",
+                visibility="full" if error <= profile.border_error_limit
+                           and not overlapping and not blockers else "partial",
+                occlusion_fraction=occlusion_fraction,
+                shade_state=shade,
+                occlusion_source="observed_overlap" if blockers else "unresolved",
             ))
         return tuple(observed), tuple(warnings)
 
@@ -242,30 +377,53 @@ class TemplateDetector:
         board = self._match(rgb, region, profile, preferred if fast else profile.scales)
         if fast and not board:
             board = self._match(rgb, region, profile, profile.scales)
+        board = self._exclude_piles(board, profile)
+        board.extend(self._partial_candidates(rgb, region, board, profile))
+        board = self._exclude_piles(board, profile)
         observed, _ = self._describe_board(rgb, board, profile)
         return observed
+
+    @staticmethod
+    def _exclude_piles(board: list[_Candidate], profile: VisionProfile) -> list[_Candidate]:
+        """Keep pile tops out of main-board decisions when the regions overlap."""
+        piles = tuple(area for area in (profile.left_pile, profile.right_pile) if area is not None)
+        return [item for item in board if not any(
+            area.contains(round(item.center[0]), round(item.center[1])) for area in piles)]
+
+    def read_tray(self, frame: CapturedFrame, profile: VisionProfile) -> tuple[str, ...] | None:
+        """Independently classify the tray when the cheap occupancy counter disagrees."""
+        rgb = self._rgb(frame)
+        candidates = self._match(rgb, profile.tray, profile, profile.tray_scales)
+        candidates.sort(key=lambda item: item.x)
+        if any(item.type_id == "unknown" or item.score < profile.click_threshold or
+               self._border_error(rgb, item) > profile.border_error_limit
+               for item in candidates):
+            return None
+        return tuple(item.type_id for item in candidates)
 
     def confirm_target(self, frame: CapturedFrame, profile: VisionProfile,
                        tile: ObservedTile) -> bool:
         """Recheck one known type at its remembered position before a click."""
-        if tile.type_id is None:
+        if tile.type_id is None or tile.type_id not in self._templates_by_type:
             return False
-        margin = max(8, round(min(tile.width, tile.height) * .15))
+        margin = max(8, round(max(tile.width, tile.height)))
         left = max(profile.board.left, round(tile.x) - margin)
         top = max(profile.board.top, round(tile.y) - margin)
         right = min(profile.board.right, round(tile.x + tile.width) + margin)
         bottom = min(profile.board.bottom, round(tile.y + tile.height) + margin)
         roi = Region(left, top, right - left, bottom - top)
         rgb = self._rgb(frame)
-        preferred = (profile.scales[len(profile.scales) // 2],)
-        matches = self._match(rgb, roi, profile, preferred, frozenset((tile.type_id,)))
-        if not matches:
-            matches = self._match(rgb, roi, profile, profile.scales, frozenset((tile.type_id,)))
-        return any(candidate.score >= profile.click_threshold and
+        source_width = self._templates_by_type[tile.type_id].original_width
+        preferred = (min(profile.scales, key=lambda scale: abs(source_width * scale - tile.width)),)
+        for scales in (preferred, profile.scales):
+            matches = self._exclude_piles(self._match(rgb, roi, profile, scales), profile)
+            observed, _ = self._describe_board(rgb, matches, profile)
+            if any(candidate.clickable and candidate.type_id == tile.type_id and
                    abs(candidate.center[0] - tile.center[0]) <= 5 and
-                   abs(candidate.center[1] - tile.center[1]) <= 5 and
-                   self._border_error(rgb, candidate) <= profile.border_error_limit
-                   for candidate in matches)
+                   abs(candidate.center[1] - tile.center[1]) <= 5
+                   for candidate in observed):
+                return True
+        return False
 
     def detect(self, frame: CapturedFrame, profile: VisionProfile) -> Observation:
         width, height = frame.image.size
@@ -276,7 +434,9 @@ class TemplateDetector:
                 profile.board.bottom > profile.tray.top and profile.tray.bottom > profile.board.top):
             raise ValueError("Board and tray regions overlap")
         rgb = self._rgb(frame)
-        board = self._match(rgb, profile.board, profile)
+        board = self._exclude_piles(self._match(rgb, profile.board, profile), profile)
+        board.extend(self._partial_candidates(rgb, profile.board, board, profile))
+        board = self._exclude_piles(board, profile)
         tray_matches = self._match(rgb, profile.tray, profile, profile.tray_scales)
         observed, board_warnings = self._describe_board(rgb, board, profile)
         warnings = list(board_warnings)
@@ -288,7 +448,20 @@ class TemplateDetector:
         occupied = self._tray_occupied_count(rgb, profile.tray)
         if len(trusted_tray) != len(tray_matches) or occupied > len(trusted_tray):
             warnings.append("Tray contains low-confidence candidate")
-        return Observation(observed, (), tray, "playing", frame.region.bbox,
+        piles: list[ObservedPile] = []
+        for name, area in (("left", profile.left_pile), ("right", profile.right_pile)):
+            if area is None:
+                continue
+            matches = self._match(rgb, area, profile)
+            trusted = [item for item in matches if item.type_id != "unknown" and
+                       item.score >= profile.click_threshold]
+            top = max(trusted, key=lambda item: item.score, default=None)
+            piles.append(ObservedPile(name, "blind", False,
+                                      top.x if top else None, top.y if top else None,
+                                      top.width if top else None, top.height if top else None,
+                                      top.type_id if top else None, None))
+        status = "playing" if observed else "unknown"
+        return Observation(observed, tuple(piles), tray, status, frame.region.bbox,
                            frame.image.size, frame.timestamp,
                            tray_confidence=1.0 if not any("Tray" in w for w in warnings) else 0.0,
                            warnings=tuple(warnings))

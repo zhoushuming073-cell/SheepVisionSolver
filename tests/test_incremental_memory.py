@@ -30,6 +30,16 @@ def test_repeated_observation_preserves_identity_and_count():
     assert memory.type_counts == {"1": 1}
 
 
+def test_unconfirmed_partial_detection_expires_after_two_local_misses():
+    memory = VisibleMemory(observation(tile("2", 20, 30, full=False, clickable=False)))
+    region = Region(0, 0, 200, 200)
+    memory.merge((), region)
+    assert len(memory.partial) == 1
+    memory.merge((), region)
+    assert memory.partial == ()
+    assert memory.type_counts == {}
+
+
 def test_partial_unknown_becomes_full_without_new_identity():
     memory = VisibleMemory(observation(tile(None, 20, 30, full=False, clickable=False)))
     original_id = memory.partial[0].id

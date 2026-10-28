@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-Status = Literal["playing", "won", "lost"]
+Status = Literal["playing", "won", "lost", "unknown", "transition", "modal"]
 Region = Literal["main", "auxiliary", "blind"]
 
 
@@ -85,6 +85,9 @@ class ObservedTile:
     visible_face: bool = True
     clickability_reason: str = "simulator rule"
     visibility: Literal["full", "partial"] = "full"
+    occlusion_fraction: float | None = None  # Screen-space estimate, never a hidden-state fact.
+    shade_state: Literal["normal", "dark", "unknown"] = "unknown"
+    occlusion_source: Literal["observed_overlap", "unresolved"] = "unresolved"
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:

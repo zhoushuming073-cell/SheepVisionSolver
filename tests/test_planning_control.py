@@ -110,6 +110,7 @@ def test_one_step_reobserves_and_logs(tmp_path: Path):
     before_image = Image.new("RGB", (200, 200), "black")
     after_image = before_image.copy()
     ImageDraw.Draw(after_image).rectangle((10, 10, 45, 45), fill="white")
+    ImageDraw.Draw(after_image).rectangle((10, 140, 45, 175), fill="white")
     before_frame = CapturedFrame(before_image, region, "before")
     after_frame = CapturedFrame(after_image, region, "after")
     frames = chain((before_frame, before_frame), repeat(after_frame))

@@ -37,9 +37,12 @@ class _Input(ctypes.Structure):
 
 
 class WindowsMouseBackend:
-    def __init__(self, stop_event: Event | None = None, *, user32: object | None = None):
+    def __init__(self, stop_event: Event | None = None, *, user32: object | None = None,
+                 expected_hwnd: int | None = None, expected_pid: int | None = None):
         self.stop_event = stop_event or Event()
         self._user32 = user32
+        self.expected_hwnd = expected_hwnd
+        self.expected_pid = expected_pid
 
     def click(self, x: int, y: int) -> None:
         if sys.platform != "win32":
@@ -64,15 +67,34 @@ class WindowsMouseBackend:
             raise RuntimeError("No game window at click coordinate")
         process_id = wintypes.DWORD()
         user32.GetWindowThreadProcessId(target, ctypes.byref(process_id))
+        if ((self.expected_hwnd is not None and int(target) != self.expected_hwnd) or
+                (self.expected_pid is not None and process_id.value != self.expected_pid)):
+            raise RuntimeError("Click target is no longer the bound game window")
         if process_id.value == os.getpid():
             raise RuntimeError("Control window covers the game click coordinate")
         if user32.GetForegroundWindow() != target:
-            if not user32.SetForegroundWindow(target):
-                raise RuntimeError("Could not focus game window")
+            focused = bool(user32.SetForegroundWindow(target))
+            if not focused and self._user32 is None:
+                # A Tk worker thread may not own the foreground input queue.
+                # Attach only for the focus transfer, then always detach.
+                foreground = user32.GetForegroundWindow()
+                foreground_thread = user32.GetWindowThreadProcessId(foreground, None)
+                current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+                user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+                user32.AttachThreadInput.restype = wintypes.BOOL
+                user32.BringWindowToTop.argtypes = [wintypes.HWND]
+                user32.BringWindowToTop.restype = wintypes.BOOL
+                if foreground_thread and foreground_thread != current_thread and user32.AttachThreadInput(
+                        current_thread, foreground_thread, True):
+                    try:
+                        user32.BringWindowToTop(target)
+                        user32.SetForegroundWindow(target)
+                    finally:
+                        user32.AttachThreadInput(current_thread, foreground_thread, False)
             if self.stop_event.wait(.05):
                 raise RuntimeError("Emergency stop active")
             if user32.GetForegroundWindow() != target:
-                raise RuntimeError("Game window did not gain focus")
+                raise RuntimeError("Could not focus game window")
         if not user32.SetCursorPos(x, y):
             raise RuntimeError("SetCursorPos failed")
         if self.stop_event.wait(.03):

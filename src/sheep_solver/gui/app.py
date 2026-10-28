@@ -6,21 +6,25 @@ import json
 import shutil
 import time
 import tkinter as tk
+from dataclasses import asdict
 from queue import Empty, Full, Queue
 from datetime import datetime
 from threading import Event, Thread
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
 from sheep_solver.capture.screen import (CapturedFrame, Region, capture_frame,
                                          load_frame, save_frame, set_dpi_awareness, virtual_screen)
 from sheep_solver.capture.selector import select_region
-from sheep_solver.control.loop import StepOutcome, VisualController
-from sheep_solver.control.mouse import SafeMouse
+from sheep_solver.capture.window import (WindowInfo, windows, current_client,
+                                         focus_window, window_for_region)
+from sheep_solver.control.loop import StepCode, StepOutcome, VisualController
+from sheep_solver.control.mouse import SafeMouse, WindowsMouseBackend
 from sheep_solver.core.models import Observation
 from sheep_solver.runtime_paths import resources_root, writable_root
 from sheep_solver.vision import TemplateDetector, VisionProfile, draw_debug
+from sheep_solver.vision.calibration import Layout, locate_layout, tray_scales_from_slots
 
 ROOT = writable_root()
 TEMPLATE_DIR = resources_root() / "assets" / "tiles" / "classic"
@@ -63,6 +67,10 @@ class SheepApp:
         self.game_region: Region | None = None
         self.board: Region | None = None
         self.tray: Region | None = None
+        self.left_pile: Region | None = None
+        self.right_pile: Region | None = None
+        self.bound_window: WindowInfo | None = None
+        self.window_content: Region | None = None
         self.frame: CapturedFrame | None = None
         self.observation: Observation | None = None
         self.controller: VisualController | None = None
@@ -77,6 +85,7 @@ class SheepApp:
         self.recognition_results: Queue[tuple[Observation | None, str | None]] = Queue(maxsize=1)
         self.recognition_active = False
         self._last_preview = 0.0
+        self.feedback_failures = 0
         self.mark_mode: str | None = None
         self.drag_start: tuple[int, int] | None = None
         self.preview_scale = 1.0
@@ -102,7 +111,8 @@ class SheepApp:
         sidebar.pack(side="left", fill="y", padx=(0, 8))
         sidebar.pack_propagate(False)
         for label, command in (
-            ("选择游戏区域", self.select_game_region),
+            ("框选游戏区域（自动分区）", self.select_game_region),
+            ("自动发现游戏窗口", self.auto_locate),
             ("获取截图", self.capture),
             ("打开本地截图", self.open_image),
             ("设置主牌区（在图上拖动）", lambda: self._begin_mark("board")),
@@ -124,6 +134,8 @@ class SheepApp:
         ttk.Label(sidebar, textvariable=self.status_var, wraplength=265).pack(fill="x", pady=5)
         self.tray_var = tk.StringVar(value="卡槽：未识别")
         ttk.Label(sidebar, textvariable=self.tray_var, wraplength=265).pack(fill="x", pady=5)
+        self.stats_var = tk.StringVar(value="确认点击 0 · 恢复 0 · 全量识别 0 · 反馈失败 0")
+        ttk.Label(sidebar, textvariable=self.stats_var, wraplength=265).pack(fill="x", pady=5)
         ttk.Label(sidebar, text="识别出的主牌（选择后可人工点击）").pack(anchor="w", pady=(12, 2))
         self.tile_list = tk.Listbox(sidebar, height=16, width=34)
         self.tile_list.pack(fill="both", expand=True)
@@ -164,10 +176,12 @@ class SheepApp:
             self.game_region = Region(*data["game_region"])
             self.board = Region(*data["board"]) if data.get("board") else None
             self.tray = Region(*data["tray"]) if data.get("tray") else None
+            self.left_pile = Region(*data["left_pile"]) if data.get("left_pile") else None
+            self.right_pile = Region(*data["right_pile"]) if data.get("right_pile") else None
             bounds = virtual_screen()
             if not (bounds.contains(self.game_region.left, self.game_region.top) and
                     bounds.contains(self.game_region.right - 1, self.game_region.bottom - 1)):
-                self.game_region = self.board = self.tray = None
+                self.game_region = self.board = self.tray = self.left_pile = self.right_pile = None
                 self._status("显示器布局变化，请重新框选游戏区域")
             else:
                 self._status("已加载上次校准；窗口移动后请重新框选")
@@ -181,7 +195,9 @@ class SheepApp:
         data = {"game_region": [self.game_region.left, self.game_region.top,
                                 self.game_region.width, self.game_region.height],
                 "board": [self.board.left, self.board.top, self.board.width, self.board.height] if self.board else None,
-                "tray": [self.tray.left, self.tray.top, self.tray.width, self.tray.height] if self.tray else None}
+                "tray": [self.tray.left, self.tray.top, self.tray.width, self.tray.height] if self.tray else None,
+                "left_pile": [self.left_pile.left, self.left_pile.top, self.left_pile.width, self.left_pile.height] if self.left_pile else None,
+                "right_pile": [self.right_pile.left, self.right_pile.top, self.right_pile.width, self.right_pile.height] if self.right_pile else None}
         CALIBRATION.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def select_game_region(self) -> None:
@@ -195,17 +211,107 @@ class SheepApp:
                 self._status("已取消区域选择")
                 return
             self.game_region = region
-            self.board = self.tray = None
+            self._bind_selected_region(region)
+            self.board = self.tray = self.left_pile = self.right_pile = None
             self.controller = None
             self.observation = None
             self._save_calibration()
-            self._status(f"游戏区域：{region.bbox}；请分别框选主牌区和卡槽区")
+            self._status(f"游戏区域：{region.bbox}；正在自动识别牌堆和卡槽")
             self.capture()
 
         try:
             select_region(self.root, selected)
         except Exception as exc:
             self._status(f"区域选择失败：{exc}")
+
+    def auto_locate(self) -> None:
+        if self.step_active or self.recognition_active:
+            self._status("请等待当前操作结束")
+            return
+        available = windows()
+        candidates = [item for item in available if
+                      any(token in item.title.lower() for token in ("mumu", "羊了个羊", "sheep"))]
+        if not candidates:
+            candidates = list(available)
+        if not candidates:
+            self._status("没有可见的候选窗口；请手动框选")
+            return
+        if len(candidates) > 1:
+            choices = "\n".join(f"{i + 1}. {item.title} ({item.client.width}×{item.client.height})"
+                                for i, item in enumerate(candidates))
+            selected = simpledialog.askinteger("选择游戏窗口", choices + "\n输入序号", parent=self.root,
+                                               minvalue=1, maxvalue=len(candidates))
+            if selected is None:
+                return
+            target = candidates[selected - 1]
+        else:
+            target = candidates[0]
+        self.root.update_idletasks()
+        control = Region(self.root.winfo_rootx(), self.root.winfo_rooty(),
+                         max(1, self.root.winfo_width()), max(1, self.root.winfo_height()))
+        placement = nonoverlap_position(target.client, control, virtual_screen())
+        if placement is None:
+            self._status("控制窗口遮挡游戏，无法安全自动定位；请先移动窗口")
+            return
+        if placement != (control.left, control.top):
+            self.root.geometry(f"+{placement[0]}+{placement[1]}")
+            self.root.update_idletasks()
+        self.recognition_active = True
+        self._status("正在检测游戏内容和卡槽锚点…")
+
+        def worker() -> None:
+            try:
+                captured = capture_frame(target.client)
+                layout = locate_layout(captured.image)
+                if layout is None or layout.confidence < .53:
+                    raise ValueError("游戏内容或卡槽锚点不可靠，请手动框选")
+                content = layout.content
+                region = Region(target.client.left + content.left, target.client.top + content.top,
+                                content.width, content.height)
+                frame = CapturedFrame(captured.image.crop(content.bbox), region,
+                                      captured.timestamp, "screen")
+                scale = .68 * content.width / 888
+                profile = VisionProfile(layout.board, layout.tray,
+                                        scales=tuple(round(scale + d, 3) for d in (-.03, 0, .03)),
+                                        tray_scales=tray_scales_from_slots(
+                                            layout.tray, self.detector.templates[0].original_width),
+                                        icon_threshold=.83, click_threshold=.88,
+                                        left_pile=layout.left_pile, right_pile=layout.right_pile)
+                observed = self.detector.detect(frame, profile)
+                if len(observed.tiles) < 3 or observed.tray_confidence < .95:
+                    raise ValueError("卡牌或卡槽校验不足，请手动调整")
+                self.recognition_results.put(((target, layout, frame, observed, scale), None))
+            except Exception as exc:
+                self.recognition_results.put((None, str(exc)))
+
+        Thread(target=worker, daemon=True).start()
+        self.root.after(50, self._poll_auto_location)
+
+    def _poll_auto_location(self) -> None:
+        try:
+            result, error = self.recognition_results.get_nowait()
+        except Empty:
+            self.root.after(50, self._poll_auto_location)
+            return
+        self.recognition_active = False
+        if error or result is None:
+            self._status(f"自动定位失败：{error}")
+            return
+        target, layout, frame, observed, scale = result
+        self.bound_window, self.window_content = target, layout.content
+        self.game_region, self.board, self.tray = frame.region, layout.board, layout.tray
+        self.left_pile, self.right_pile = layout.left_pile, layout.right_pile
+        self.frame, self.observation, self.controller = frame, observed, None
+        self.mouse = SafeMouse(WindowsMouseBackend(self.stop_event,
+                               expected_hwnd=target.hwnd, expected_pid=target.pid),
+                               stop_event=self.stop_event)
+        self.scale_var.set(f"{scale:.3f}")
+        self.needs_manual_sync = False
+        self._save_calibration()
+        self._show_preview(draw_debug(frame.image, observed))
+        self._update_tile_list(observed)
+        self.tray_var.set("卡槽：" + (", ".join(observed.tray) or "空"))
+        self._status(f"已绑定 {target.title}；识别 {len(observed.tiles)} 张牌")
 
     def capture(self) -> None:
         if self.step_active or self.recognition_active:
@@ -221,14 +327,29 @@ class SheepApp:
             self.root.after(200, self.capture)
             return
         try:
+            if self.bound_window is not None:
+                current = self._bound_content_region()
+                if current is None or not focus_window(self.bound_window.hwnd, self.bound_window.pid):
+                    self._status("游戏窗口不在前台或尺寸已变化；请重新框选游戏区域")
+                    return
+                self.game_region = current
             self.frame = capture_frame(self.game_region)
             self.scale_var.set(f"{.68 * self.frame.image.width / 888:.3f}")
             self.observation = None
             self.controller = None
+            if self.board is None or self.tray is None:
+                layout = locate_layout(self.frame.image)
+                if layout is not None and layout.confidence >= .53:
+                    self.board, self.tray, self.left_pile, self.right_pile, _ = layout.regions_in_image()
+                    self._save_calibration()
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             save_frame(self.frame, ROOT / "data" / "screenshots" / f"capture-{stamp}.png")
             self._show_preview(self.frame.image)
-            self._status(f"截图成功：{self.frame.image.size}，屏幕原点 {self.game_region.left},{self.game_region.top}")
+            if self.board is not None and self.tray is not None:
+                self._status("截图成功；已自动标出主牌、左右牌堆和卡槽，正在识别牌面")
+                self.recognize()
+            else:
+                self._status("截图成功，但无法确认牌堆和卡槽位置；请在图上手动修正")
         except Exception as exc:
             self._status(f"截图失败：{exc}")
 
@@ -244,9 +365,12 @@ class SheepApp:
             self.scale_var.set(f"{.68 * self.frame.image.width / 888:.3f}")
             self.observation = None
             self.controller = None
-            self.board = self.tray = None
+            self.board = self.tray = self.left_pile = self.right_pile = None
+            layout = locate_layout(self.frame.image)
+            if layout is not None and layout.confidence >= .53:
+                self.board, self.tray, self.left_pile, self.right_pile, _ = layout.regions_in_image()
             self._show_preview(self.frame.image)
-            self._status("已打开离线截图；可识别和调试，不能据此点击实时桌面")
+            self._status("已打开离线截图并尝试自动分区；可识别和调试，不能据此点击实时桌面")
         except Exception as exc:
             self._status(f"打开失败：{exc}")
 
@@ -264,7 +388,9 @@ class SheepApp:
         self.photo = ImageTk.PhotoImage(display)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
-        for name, region, color in (("主牌区", self.board, "#42df80"), ("卡槽区", self.tray, "#facc15")):
+        for name, region, color in (("主牌区", self.board, "#42df80"), ("卡槽区", self.tray, "#facc15"),
+                                    ("左牌堆", self.left_pile, "#50a8ff"),
+                                    ("右牌堆", self.right_pile, "#50a8ff")):
             if region:
                 self.canvas.create_rectangle(region.left * scale, region.top * scale,
                                              region.right * scale, region.bottom * scale,
@@ -322,7 +448,7 @@ class SheepApp:
 
     def _profile(self) -> VisionProfile | None:
         if self.board is None or self.tray is None:
-            self._status("请先框选主牌区和卡槽区")
+            self._status("尚未找到主牌区和卡槽；请重新框选游戏区域或在图上修正")
             return None
         try:
             base = float(self.scale_var.get())
@@ -332,9 +458,10 @@ class SheepApp:
             self._status("模板缩放需为 0.25 到 2.5 的数字")
             return None
         scales = tuple(round(base + delta, 3) for delta in (-.03, 0, .03))
-        tray_scales = tuple(round(base * factor, 3) for factor in (1.18, 1.23, 1.28))
+        tray_scales = tray_scales_from_slots(self.tray, self.detector.templates[0].original_width)
         return VisionProfile(self.board, self.tray, scales=scales, tray_scales=tray_scales,
-                             icon_threshold=.83, click_threshold=.88)
+                             icon_threshold=.83, click_threshold=.88,
+                             left_pile=self.left_pile, right_pile=self.right_pile)
 
     def recognize(self) -> None:
         profile = self._profile()
@@ -374,13 +501,20 @@ class SheepApp:
         debug_path = ROOT / "data" / "screenshots" / f"debug-{stamp}.png"
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         debug_image.save(debug_path)
+        (debug_path.with_suffix(".json")).write_text(
+            json.dumps({"tiles": [asdict(tile) for tile in observation.tiles],
+                        "tray": observation.tray, "warnings": observation.warnings,
+                        "timestamp": observation.timestamp}, ensure_ascii=False, indent=2),
+            encoding="utf-8")
         self._status(f"识别 {len(observation.tiles)} 张；可点 {sum(t.clickable for t in observation.tiles)} 张；调试图：{debug_path}")
 
     def _update_tile_list(self, observation: Observation) -> None:
         self.tile_list.delete(0, tk.END)
         self.list_ids.clear()
         for tile in observation.tiles:
-            self.tile_list.insert(tk.END, f"{tile.id} 类型{tile.type_id or '?'} {tile.confidence:.2f} {'可点' if tile.clickable else '待核实'}")
+            self.tile_list.insert(tk.END, f"{tile.id} 类型{tile.type_id or '?'} {tile.confidence:.2f} "
+                                  f"{tile.shade_state}/{tile.visibility} "
+                                  f"{'可点' if tile.clickable else '待核实'}")
             self.list_ids.append(tile.id)
 
     def _new_controller(self) -> VisualController | None:
@@ -392,6 +526,10 @@ class SheepApp:
             return None
         if self._move_off_game() != "clear":
             self._status("控制窗口已移动；请重新获取截图并识别后再点击")
+            return None
+        if self.bound_window is not None and not focus_window(self.bound_window.hwnd,
+                                                                self.bound_window.pid):
+            self._status("无法将游戏窗口置前；已禁止点击")
             return None
         profile = self._profile()
         if profile is None or self.game_region is None or self.frame is None or self.frame.source != "screen":
@@ -405,7 +543,9 @@ class SheepApp:
         self.stop_event.clear()
         self.controller = VisualController(self.detector, profile, self.game_region,
                                            mouse=self.mouse, stop_event=self.stop_event,
-                                           log_path=LOG_PATH)
+                                            log_path=LOG_PATH,
+                                            window_region=(lambda: self._bound_content_region())
+                                            if self.bound_window else None)
         if self.observation is not None and self.frame.region == self.game_region:
             try:
                 self.controller.initialize_from_observation(self.frame, self.observation)
@@ -413,25 +553,64 @@ class SheepApp:
                 pass  # Fresh screen recognition remains available in the worker.
         return self.controller
 
+    def _bind_selected_region(self, region: Region) -> None:
+        target = window_for_region(region)
+        self.bound_window = target
+        if target is None:
+            self.window_content = None
+            self.mouse = SafeMouse(stop_event=self.stop_event)
+            return
+        self.window_content = Region(region.left - target.client.left,
+                                     region.top - target.client.top,
+                                     region.width, region.height)
+        self.mouse = SafeMouse(WindowsMouseBackend(self.stop_event,
+                               expected_hwnd=target.hwnd, expected_pid=target.pid),
+                               stop_event=self.stop_event)
+
+    def _bound_content_region(self) -> Region | None:
+        if self.bound_window is None or self.window_content is None:
+            return None
+        client = current_client(self.bound_window.hwnd, self.bound_window.pid)
+        content = self.window_content
+        if client is None or client.width != self.bound_window.client.width or client.height != self.bound_window.client.height:
+            return None
+        return Region(client.left + content.left, client.top + content.top,
+                      content.width, content.height)
+
     def _apply_outcome(self, outcome: StepOutcome) -> None:
-        self._status(f"{outcome.reason}；决策：{outcome.decision.reason}；目标：{outcome.decision.action}")
-        if not outcome.success and ("未稳定" in outcome.reason or
-                                    "点击前画面变化" in outcome.reason or
-                                    "目标牌验证失败" in outcome.reason):
-            self.controller = None
+        self._status(f"{outcome.code.value}：{outcome.reason}；决策：{outcome.decision.reason}")
+        if outcome.code in (StepCode.ANIMATION_TIMEOUT, StepCode.CLICK_UNCHANGED,
+                            StepCode.TRAY_CONFLICT, StepCode.VISUAL_CONFLICT):
+            self.feedback_failures += 1
+        if outcome.code in (StepCode.ANIMATION_TIMEOUT, StepCode.PRECLICK_CHANGED,
+                            StepCode.TARGET_CHANGED, StepCode.CLICK_UNCHANGED,
+                            StepCode.UNRECOVERABLE, StepCode.WINDOW_CHANGED):
+            if outcome.code in (StepCode.CLICK_UNCHANGED, StepCode.UNRECOVERABLE,
+                                StepCode.WINDOW_CHANGED) or not self.running:
+                self.controller = None
             self.frame = None
             self.observation = None
             self.needs_manual_sync = True
         if outcome.after_frame and outcome.after:
             self.frame = outcome.after_frame
             self.observation = outcome.after
+            self.game_region = outcome.after_frame.region
             self._update_tile_list(outcome.after)
             if not self.running or time.monotonic() - self._last_preview >= .5:
                 self._show_preview(self.frame.image if self.running else
                                    draw_debug(self.frame.image, outcome.after))
                 self._last_preview = time.monotonic()
             self.tray_var.set("卡槽：" + (", ".join(outcome.after.tray) or "空"))
-        if not outcome.success:
+        if outcome.code == StepCode.RECOVERED and self.running and not self.stop_event.is_set():
+            self.needs_manual_sync = False
+        if self.controller:
+            self.stats_var.set(f"确认点击 {self.controller.confirmed_clicks} · "
+                               f"恢复 {self.controller.recovery_count} · "
+                               f"全量识别 {self.controller.full_syncs} · "
+                               f"反馈失败 {self.feedback_failures}")
+        if not outcome.success and outcome.code not in (
+                StepCode.RECOVERED, StepCode.PRECLICK_CHANGED, StepCode.TARGET_CHANGED,
+                StepCode.ANIMATION_TIMEOUT, StepCode.VISUAL_CONFLICT, StepCode.TRAY_CONFLICT):
             self.running = False
 
     def manual_click(self) -> None:
@@ -470,6 +649,7 @@ class SheepApp:
 
         def worker() -> None:
             first = True
+            consecutive_recoveries = 0
             while first or (self.running and not controller.stop_event.is_set()):
                 outcome = controller.run_once(manual_tile_id if first else None,
                                               manual_expected if first else None)
@@ -481,8 +661,24 @@ class SheepApp:
                         if controller.stop_event.is_set():
                             return
                 first = False
-                if not outcome.success:
-                    break
+                if outcome.success:
+                    consecutive_recoveries = 0
+                    continue
+                if (self.running and consecutive_recoveries < 2 and outcome.code in
+                        (StepCode.PRECLICK_CHANGED, StepCode.TARGET_CHANGED,
+                         StepCode.ANIMATION_TIMEOUT, StepCode.VISUAL_CONFLICT,
+                         StepCode.TRAY_CONFLICT)):
+                    recovery = controller.recover()
+                    consecutive_recoveries += 1
+                    while not controller.stop_event.is_set():
+                        try:
+                            self.step_results.put(recovery, timeout=.1)
+                            break
+                        except Full:
+                            continue
+                    if recovery.code == StepCode.RECOVERED:
+                        continue
+                break
 
         self.step_thread = Thread(target=worker, daemon=True)
         self.step_thread.start()
@@ -504,12 +700,14 @@ class SheepApp:
         self.running = False
         if self.controller:
             self.controller.stop_event.set()
+        self.needs_manual_sync = True
         self._status("已暂停；重新开始会先重新截图和识别")
 
     def stop(self) -> None:
         self.running = False
         if self.controller:
             self.controller.stop_event.set()
+        self.needs_manual_sync = True
         self._status("已停止")
 
     def emergency_stop(self) -> None:
